@@ -2,7 +2,7 @@
 
 **Auditable literature retrieval and evidence management for software engineering systematic reviews.**
 
-Version 0.3.0 — research prototype. Python 3.10 or newer; no third-party packages. No account credentials, private manuscript, paid publisher exports, or review outcomes are included.
+Version 0.4.0 — research prototype. Python 3.10 or newer; no third-party packages. No account credentials, private manuscript, paid publisher exports, or review outcomes are included.
 
 ## Quick start (Windows PowerShell)
 
@@ -88,12 +88,25 @@ py slrkit.py merge --run runs/formal-01 --run runs/chase-01 --csv "Scopus=privat
 
 5. **Screen:** independently copy `title_abstract_screening.csv` for each reviewer. Use `include`, `exclude`, `uncertain`; write exclusion reasons, and resolve disagreements separately. Full-text screening, source-located evidence extraction and final study-family adjudication are human-controlled. Do not screen out missing abstracts automatically.
 
+### arXiv preprint search (v0.4.0; no API key)
+
+Use the same Boolean search configuration as OpenAlex. The adapter translates each term or quoted phrase into a title-or-abstract clause; it skips semantic queries when running the whole configuration. Query matching is provider-specific, so translated searches are not necessarily equivalent in recall. The submitted-date window is UTC.
+
+```powershell
+py slrkit.py arxiv-search --config config/coding-agents-pilot.json --only Q01_agent_verification --out runs/arxiv-check-01 --max-pages 1
+py slrkit.py arxiv-search --config config/coding-agents-pilot.json --out runs/arxiv-full-01
+```
+
+Run the uncapped command only after reviewing the capped pilot. The client uses 100 results per page and a default 3.1-second delay between calls, sequentially. Do not run concurrent arXiv searches. Refine or partition large queries; the adapter refuses to mark changed totals, repeated IDs, incomplete pages or more than 30,000 results complete. Raw XML and checksummed query manifests are retained. A network or access failure stops the run.
+
+Merge completed arXiv runs just like other providers. Version suffixes on arXiv IDs are normalized for identity linking, while the observed version URLs are retained. A publisher DOI in arXiv metadata is a relationship, not automatic proof of identity with a published paper; record it separately and adjudicate study families. Only exact shared identifiers are merged. Preprints and peer-reviewed publications must be distinguished during screening. No full-text downloads are performed.
+
 ## Outputs and interpretation
 
 | File | Function |
 |---|---|
 | `manifest.json` and `config.json` | Query and run provenance, completion state, hashes |
-| `raw/*.json` | Original API responses (keep licensed data private) |
+| `raw/*.json` or `raw/*.xml` | Original API responses (keep licensed data private) |
 | `records.csv` | Identifier-linked candidate clusters |
 | `provenance.csv` | Every retrieval occurrence, source, original row location and date-scope flag |
 | `identifier_conflicts.csv` | Distinct DOI, OpenAlex IDs or Scopus EIDs linked into a candidate cluster; requires adjudication |
@@ -112,7 +125,7 @@ Source-exclusive candidate counts and overlaps support a later **coverage audit*
 py -m unittest discover -s tests -v
 ```
 
-Offline tests simulate OpenAlex, Scopus and Semantic Scholar responses and synthetic metadata. A real connection must be commissioned on the researcher's network; passing tests do not establish API availability, query adequacy, retrieval recall, AI screening accuracy, or scientific inclusion. The toolkit does not currently implement AI screening, semantic embedding locally, the Web of Science API adapter, screening consensus, automatic BibTeX export, or automatic revision linking. These are planned extensions. Use human validation and disclose any later AI use. Preserve raw licensed files privately and release only permitted metadata.
+Offline tests simulate OpenAlex, Scopus, Semantic Scholar and arXiv responses and synthetic metadata. A real connection must be commissioned on the researcher's network; passing tests do not establish API availability, query adequacy, retrieval recall, AI screening accuracy, or scientific inclusion. The toolkit does not currently implement AI screening, semantic embedding locally, the Web of Science API adapter, screening consensus, automatic BibTeX export, or automatic revision linking. These are planned extensions. Use human validation and disclose any later AI use. Preserve raw licensed files privately and release only permitted metadata.
 
 ## Reproducibility and documentation
 
@@ -120,6 +133,8 @@ Offline tests simulate OpenAlex, Scopus and Semantic Scholar responses and synth
 - Scopus Search API: https://dev.elsevier.com/documentation/ScopusSearchAPI.wadl
 - Scopus access and quotas: https://dev.elsevier.com/api_key_settings.html
 - Semantic Scholar Academic Graph API: https://api.semanticscholar.org/api-docs/
+- arXiv API manual: https://info.arxiv.org/help/api/user-manual.html
+- arXiv API terms: https://info.arxiv.org/help/api/tou.html
 - Search and cursor paging: https://help.openalex.org/api/searching/ and https://help.openalex.org/api/paging/
 - Citation chasing: https://help.openalex.org/how-to/api-recipes/
 - PRISMA-S: https://doi.org/10.1186/s13643-020-01542-z

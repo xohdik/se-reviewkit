@@ -297,5 +297,67 @@ class ToolkitTests(unittest.TestCase):
                 list(kit.read_run(run, False))
 
 
+def atom_page(ids,total,start=0,related=""):
+    records="".join(f'<entry><id>http://arxiv.org/abs/{aid}v2</id><title>Example paper</title><published>2025-01-01T00:00:00Z</published><summary>Some evidence</summary><author><name>A. Author</name></author><arxiv:doi>{related}</arxiv:doi></entry>' for aid in ids)
+    return f'<feed xmlns="http://www.w3.org/2005/Atom" xmlns:opensearch="http://a9.com/-/spec/opensearch/1.1/" xmlns:arxiv="http://arxiv.org/schemas/atom"><opensearch:totalResults>{total}</opensearch:totalResults><opensearch:startIndex>{start}</opensearch:startIndex>{records}</feed>'.encode()
+
+
+class ArxivTests(unittest.TestCase):
+    def test_identity_and_related_doi(self):
+        self.assertEqual(kit.arxiv_id("https://arxiv.org/pdf/2501.12345v2.pdf"),"2501.12345")
+        self.assertEqual(kit.arxiv_id("10.48550/arXiv.2501.12345"),"2501.12345")
+        self.assertEqual(kit.arxiv_id("10.1234/example"),"")
+        row=kit.arxiv_page(atom_page(["2501.12345"],1,related="10.1234/example"))[2][0]
+        self.assertEqual(row["doi"],"")
+        self.assertEqual(row["arxiv_related_doi"],"10.1234/example")
+        self.assertEqual(kit.arxiv_page(atom_page([],0))[2],[])
+        self.assertIn('ti:"coding agent" OR abs:"coding agent"',kit.arxiv_query('"coding agent" AND testing'))
+        with self.assertRaises(ValueError):
+            kit.arxiv_query('ti:agent')
+
+    def test_paging_and_merge(self):
+        from unittest.mock import MagicMock
+        with tempfile.TemporaryDirectory() as d:
+            base=Path(d)
+            run=base/"arxiv"
+            m=kit.run_create(run,"arxiv_search",{"from_date":"2022-01-01","to_date":"2026-11-18"})
+            client=MagicMock()
+            client.fetch.side_effect=[atom_page(["2501.12345"],2,related="10.1234/example"),atom_page(["2501.12346"],2,1)]
+            kit.retrieve_arxiv(client,run,m,"A1",{"max_results":1})
+            m["status"]="complete"
+            kit.save_manifest(run,m)
+            self.assertEqual(client.fetch.call_args.args[0]["start"],1)
+            self.assertEqual(m["queries"][0]["status"],"exhausted")
+            oa=base/"oa"
+            kit.execute_run(oa,"search",{},[("Q",{})],MockClient([page([work("W1","Example paper","10.48550/arxiv.2501.12345"),work("W2","Example paper","10.1234/example")])]),None)
+            args=SimpleNamespace(run=[oa,run],csv=[],allow_partial=False,out=base/"merged")
+            kit.merge(args)
+            report=json.loads((args.out/"report.json").read_text())
+            self.assertEqual(report["retrieval_occurrences"],4)
+            self.assertEqual(report["identifier_clusters"],3)
+            self.assertEqual(report["source_overlap"]["OpenAlex"]["arXiv"],1)
+            self.assertEqual(report["date_scope_occurrences"]["in_window"],2)
+            self.assertEqual(report["title_only_version_candidates"],3)
+            (run/m["pages"][0]["path"]).write_bytes(b"modified")
+            with self.assertRaisesRegex(ValueError,"checksum"):
+                list(kit.read_run(run,False))
+
+    def test_cap_and_pagination_failures(self):
+        from unittest.mock import MagicMock
+        with tempfile.TemporaryDirectory() as d:
+            run=Path(d)/"arxiv"
+            m=kit.run_create(run,"arxiv_search",{})
+            client=MagicMock()
+            client.fetch.return_value=atom_page(["2501.12345"],2)
+            kit.retrieve_arxiv(client,run,m,"A1",{"max_results":1},1)
+            self.assertEqual(m["queries"][0]["status"],"capped")
+            client.fetch.side_effect=[atom_page(["2501.12345"],2),atom_page(["2501.12345"],2,1)]
+            with self.assertRaisesRegex(RuntimeError,"repeated"):
+                kit.retrieve_arxiv(client,run,m,"A2",{"max_results":1})
+            client.fetch.side_effect=[atom_page(["2501.12345"],2),atom_page(["2501.12346"],3,1)]
+            with self.assertRaisesRegex(RuntimeError,"pagination"):
+                kit.retrieve_arxiv(client,run,m,"A3",{"max_results":1})
+
+
 if __name__ == "__main__":
     unittest.main()

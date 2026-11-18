@@ -14,14 +14,17 @@ import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
+import xml.etree.ElementTree as ET
 from collections import Counter, defaultdict
 from pathlib import Path
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 API = "https://api.openalex.org/works"
 SCOPUS_API = "https://api.elsevier.com/content/search/scopus"
 S2_API = "https://api.semanticscholar.org/graph/v1/paper/search/bulk"
 S2_FIELDS = "paperId,externalIds,title,year,publicationDate,authors,venue,publicationTypes,abstract,url"
+ARXIV_API = "https://export.arxiv.org/api/query"
+ATOM = {"a":"http://www.w3.org/2005/Atom","o":"http://a9.com/-/spec/opensearch/1.1/","x":"http://arxiv.org/schemas/atom"}
 FIELDS = "id,doi,title,publication_year,publication_date,authorships,primary_location,type,abstract_inverted_index,referenced_works,open_access"
 COLS = ["record_id", "title", "year", "publication_date", "doi", "openalex_id", "authors", "venue", "type", "abstract", "url", "sources", "query_ids", "occurrences"]
 
@@ -117,6 +120,66 @@ def normalize_s2(work):
         "authors":"; ".join(a.get("name") or "" for a in (work.get("authors") or [])),
         "venue":work.get("venue") or "", "type":"; ".join(work.get("publicationTypes") or []),
         "abstract":work.get("abstract") or "", "url":work.get("url") or ""}
+
+
+def arxiv_id(value):
+    value=str(value or "").strip().lower()
+    value=re.sub(r"^(https?://(?:www\.)?arxiv\.org/(?:abs|pdf)/|https?://(?:dx\.)?doi\.org/10\.48550/arxiv\.|10\.48550/arxiv\.|arxiv:\s*)","",value)
+    value=re.sub(r"(?:v\d+)?(?:\.pdf)?$","",value)
+    return value if re.fullmatch(r"(?:\d{4}\.\d{4,5}|[a-z][a-z.\-]+/\d{7})",value) else ""
+
+
+def arxiv_query(text):
+    # The shared pilot Boolean grammar is intentionally restricted.
+    parts=re.findall(r'"[^"]+"|\(|\)|\bAND\b|\bOR\b|[A-Za-z0-9_.-]+',text)
+    if re.sub(r"\s+","", "".join(parts))!=re.sub(r"\s+","",text):
+        raise ValueError("Unsupported arXiv translation syntax; use quoted phrases and AND/OR.")
+    return " ".join(t if t in ("(",")","AND","OR") else f"(ti:{t} OR abs:{t})" for t in parts)
+
+
+def arxiv_page(body):
+    try:
+        root=ET.fromstring(body)
+        total=int(root.findtext("o:totalResults",namespaces=ATOM))
+        start=int(root.findtext("o:startIndex",namespaces=ATOM))
+    except (ET.ParseError,TypeError,ValueError):
+        raise RuntimeError("Invalid arXiv Atom feed or pagination metadata.") from None
+    entries=root.findall("a:entry",ATOM)
+    rows=[]
+    for entry in entries:
+        field=lambda tag: " ".join((entry.findtext(tag,default="",namespaces=ATOM) or "").split())
+        url=field("a:id")
+        aid=arxiv_id(url)
+        title=field("a:title")
+        if not aid or not title:
+            raise RuntimeError("arXiv returned an error entry or invalid paper identifier.")
+        published=field("a:published")[:10]
+        related=doi(field("x:doi"))
+        direct=related if related.startswith("10.48550/arxiv.") and arxiv_id(related)==aid else ""
+        rows.append({"title":title,"year":published[:4],"publication_date":published,"doi":direct,"openalex_id":"",
+            "arxiv_id":aid,"arxiv_version_url":url,"arxiv_related_doi":related if related!=direct else "",
+            "authors":"; ".join(" ".join((a.findtext("a:name",default="",namespaces=ATOM) or "").split()) for a in entry.findall("a:author",ATOM)),
+            "venue":"arXiv","type":"preprint","abstract":field("a:summary"),"url":url})
+    if total<0 or start<0:
+        raise RuntimeError("Invalid arXiv pagination counts.")
+    return total,start,rows
+
+
+class Arxiv:
+    def __init__(self,delay=3.1,timeout=60):
+        self.delay,self.timeout=delay,timeout
+
+    def fetch(self,params):
+        url=ARXIV_API+"?"+urllib.parse.urlencode(params)
+        try:
+            with urllib.request.urlopen(urllib.request.Request(url,headers={"User-Agent":"SE-ReviewKit/"+VERSION,"Accept":"application/atom+xml"}),timeout=self.timeout) as response:
+                body=response.read()
+            time.sleep(self.delay)
+            return body
+        except urllib.error.HTTPError as exc:
+            raise RuntimeError(f"arXiv HTTP {exc.code}: stop and check API service, access, or query syntax.") from None
+        except (urllib.error.URLError,TimeoutError,OSError):
+            raise RuntimeError("arXiv connection failed; check network access.") from None
 
 
 class SemanticScholar:
@@ -420,6 +483,74 @@ def s2_search(args):
         save_manifest(args.out,manifest)
 
 
+def retrieve_arxiv(client,out,manifest,qid,params,max_pages=None):
+    if not re.fullmatch(r"[A-Za-z0-9_-]+",qid):
+        raise ValueError("Invalid query identifier.")
+    entry={"query_id":qid,"params":params,"started_utc":now(),"hits_first_page":None,"retrieved_occurrences":0,"pages":0,"status":"running"}
+    manifest["queries"].append(entry)
+    save_manifest(out,manifest)
+    offset=0
+    seen=set()
+    while True:
+        body=client.fetch({**params,"start":offset})
+        total,start,rows=arxiv_page(body)
+        if entry["pages"]==0:
+            entry["hits_first_page"]=total
+        if start!=offset or total!=entry["hits_first_page"] or len(rows)!=min(params["max_results"],total-offset):
+            raise RuntimeError("arXiv pagination changed or returned an incomplete page; run not complete.")
+        ids=[r["arxiv_id"] for r in rows]
+        if len(set(ids))!=len(ids) or seen.intersection(ids):
+            raise RuntimeError("arXiv repeated a paper within a query; run not complete.")
+        seen.update(ids)
+        entry["pages"]+=1
+        offset+=len(rows)
+        entry["retrieved_occurrences"]=offset
+        filename=f"raw/{qid}-{entry['pages']:06d}.xml"
+        (out/filename).write_bytes(body)
+        manifest["pages"].append({"query_id":qid,"path":filename,"sha256":digest(body),"retrieved_utc":now(),"rows":len(rows)})
+        save_manifest(out,manifest)
+        print(f"{qid}: page {entry['pages']}, {offset}/{total} records",flush=True)
+        if offset==total:
+            entry["status"]="exhausted"
+            break
+        if max_pages and entry["pages"]>=max_pages:
+            entry["status"]="capped"
+            break
+        if total>30000:
+            raise RuntimeError("arXiv query exceeds 30,000 results; refine or partition the date range.")
+    entry["finished_utc"]=now()
+    save_manifest(out,manifest)
+
+
+def arxiv_search(args):
+    config=json.loads(args.config.read_text(encoding="utf-8-sig"))
+    start,end=config["from_date"],config["to_date"]
+    if dt.date.fromisoformat(start)>dt.date.fromisoformat(end) or not 1<=args.count<=200 or args.delay<3:
+        raise ValueError("Need valid dates, --count 1..200, and --delay >=3 seconds.")
+    queries=[q for q in config["queries"] if q.get("mode","boolean")=="boolean" and (not args.only or q["id"] in args.only)]
+    if not queries or len({q["id"] for q in queries})!=len(queries) or (args.only and set(args.only)!={q["id"] for q in queries}):
+        raise ValueError("Need distinct known Boolean query IDs; semantic queries are not translated.")
+    config["skipped_query_ids"]=[q["id"] for q in config["queries"] if q not in queries]
+    config["queries"]=queries
+    config["date_field"]="submittedDate UTC"
+    tasks=[]
+    for q in queries:
+        translated=f"({arxiv_query(q['text'])}) AND submittedDate:[{start.replace('-','')}0000 TO {end.replace('-','')}2359]"
+        tasks.append(("A"+q["id"][1:] if q["id"].startswith("Q") else q["id"],{"search_query":translated,"sortBy":"submittedDate","sortOrder":"ascending","max_results":args.count}))
+    manifest=run_create(args.out,"arxiv_search",config)
+    try:
+        client=Arxiv(delay=args.delay)
+        for qid,params in tasks:
+            retrieve_arxiv(client,args.out,manifest,qid,params,args.max_pages)
+        manifest["status"]="complete" if all(q["status"]=="exhausted" for q in manifest["queries"]) else "partial_capped"
+    except (Exception,KeyboardInterrupt):
+        manifest["status"]="failed_or_interrupted"
+        raise
+    finally:
+        manifest["finished_utc"]=now()
+        save_manifest(args.out,manifest)
+
+
 def retrieve(client, out, manifest, query_id, params, max_pages=None):
     if not re.fullmatch(r"[A-Za-z0-9_-]+", query_id):
         raise ValueError("Query identifier must be alphanumeric, underscore or hyphen.")
@@ -549,14 +680,15 @@ def read_run(run, allow_partial):
         body = path.read_bytes()
         if digest(body) != p["sha256"]:
             raise ValueError(f"Page checksum mismatch: {path}")
-        data = json.loads(body)
+        is_arxiv = m.get("kind") == "arxiv_search"
+        data = None if is_arxiv else json.loads(body)
         is_scopus = m.get("kind") == "scopus_search"
         is_s2 = m.get("kind") == "s2_search"
-        results = scopus_page(data)[2] if is_scopus else s2_page(data)[1] if is_s2 else data["results"]
+        results = arxiv_page(body)[2] if is_arxiv else scopus_page(data)[2] if is_scopus else s2_page(data)[1] if is_s2 else data["results"]
         if len(results) != p["rows"]:
             raise ValueError(f"Page count mismatch: {path}")
         for i, work in enumerate(results, 1):
-            item = normalize_scopus(work) if is_scopus else normalize_s2(work) if is_s2 else normalize_work(work)
+            item = work if is_arxiv else normalize_scopus(work) if is_scopus else normalize_s2(work) if is_s2 else normalize_work(work)
             date = item.get("publication_date") or ""
             scope = "unknown"
             if config.get("from_date") and config.get("to_date") and re.fullmatch(r"\d{4}-\d{2}-\d{2}", date):
@@ -565,7 +697,7 @@ def read_run(run, allow_partial):
                     scope = "cover_date_" + scope
             if is_s2 and scope == "unknown" and re.fullmatch(r"\d{4}",item["year"]) and config.get("from_date") and config.get("to_date"):
                 scope = "year_in_window_date_unknown" if config["from_date"][:4] <= item["year"] <= config["to_date"][:4] else "year_outside_window"
-            yield item, {"source": "Scopus" if is_scopus else "Semantic Scholar" if is_s2 else "OpenAlex", "query_id": p["query_id"], "raw_path": str(path), "row": i, "sha256": p["sha256"], "date_scope": scope}
+            yield item, {"source": "arXiv" if is_arxiv else "Scopus" if is_scopus else "Semantic Scholar" if is_s2 else "OpenAlex", "query_id": p["query_id"], "raw_path": str(path), "row": i, "sha256": p["sha256"], "date_scope": scope}
 
 
 def read_csv(source, path):
@@ -586,6 +718,9 @@ def read_csv(source, path):
 def consolidate(occurrences):
     # Union exact shared identifiers, never title-only candidates. Conflicting
     # DOI or OpenAlex identity is retained for adjudication rather than hidden.
+    if any("arxiv_id" in i for i,_ in occurrences):
+        occurrences=[({**i,"arxiv_id":i.get("arxiv_id") or arxiv_id(i["doi"]) or (arxiv_id(i["url"]) if not i["doi"] and re.match(r"https?://(?:www\.)?arxiv\.org/(?:abs|pdf)/",i["url"]) else "")},p) for i,p in occurrences]
+    identity_fields=("doi","openalex_id","scopus_id","s2_id","arxiv_id")
     parent = list(range(len(occurrences)))
     def find(i):
         while parent[i] != i:
@@ -594,7 +729,7 @@ def consolidate(occurrences):
         return i
     seen = {}
     for i, (item, provenance) in enumerate(occurrences):
-        for name in ("doi", "openalex_id", "scopus_id", "s2_id"):
+        for name in identity_fields:
             if item.get(name):
                 k = (name, item[name])
                 if k in seen:
@@ -602,7 +737,7 @@ def consolidate(occurrences):
                     parent[max(a, b)] = min(a, b)
                 else:
                     seen[k] = i
-        if not any(item.get(name) for name in ("doi","openalex_id","scopus_id","s2_id")):
+        if not any(item.get(name) for name in identity_fields):
             k = ("exact_occurrence", provenance["source"], provenance["sha256"], provenance["row"])
             if k in seen:
                 a, b = find(i), find(seen[k])
@@ -618,19 +753,24 @@ def consolidate(occurrences):
         wids = sorted({i["openalex_id"] for i, _ in group if i["openalex_id"]})
         sids = sorted({i["scopus_id"] for i, _ in group if i.get("scopus_id")})
         s2ids = sorted({i["s2_id"] for i, _ in group if i.get("s2_id")})
-        signature = ids + wids + sids + s2ids or sorted({p["source"] + ":" + p["sha256"] + ":" + str(p["row"]) for _, p in group})
+        aids=sorted({i["arxiv_id"] for i,_ in group if i.get("arxiv_id")})
+        signature = ids + wids + sids + s2ids + ["arxiv:"+a for a in aids] or sorted({p["source"] + ":" + p["sha256"] + ":" + str(p["row"]) for _, p in group})
         rid = "R-" + digest(";".join(signature).encode())[:20]
         row = {k: max((i[k] for i, _ in group), key=lambda v: (len(v), v)) for k in COLS if k in group[0][0]}
         if any("scopus_id" in i for i, _ in group):
             row["scopus_id"] = ";".join(sids)
         if any("s2_id" in i for i, _ in group):
             row["s2_id"] = ";".join(s2ids)
+        if any("arxiv_id" in i for i,_ in group):
+            row["arxiv_id"]=";".join(aids)
+            for field in ("arxiv_related_doi","arxiv_version_url"):
+                row[field]=";".join(sorted({i[field] for i,_ in group if i.get(field)}))
         row.update(record_id=rid, sources=";".join(sorted({p["source"] for _, p in group})), query_ids=";".join(sorted({p["query_id"] for _, p in group})), occurrences=len(group))
         records.append(row)
-        if len(ids) > 1 or len(wids) > 1 or len(sids) > 1 or len(s2ids)>1:
-            conflicts.append({"record_id": rid, "dois": ";".join(ids), "openalex_ids": ";".join(wids), "scopus_ids": ";".join(sids), "s2_ids":";".join(s2ids), "status": "needs_adjudication"})
+        if len(ids) > 1 or len(wids) > 1 or len(sids) > 1 or len(s2ids)>1 or len(aids)>1:
+            conflicts.append({"record_id": rid, "dois": ";".join(ids), "openalex_ids": ";".join(wids), "scopus_ids": ";".join(sids), "s2_ids":";".join(s2ids), "arxiv_ids":";".join(aids), "status": "needs_adjudication"})
         for item, p in group:
-            provenance.append({"record_id": rid, **p, "observed_doi": item["doi"], "observed_openalex_id": item["openalex_id"], "observed_scopus_id": item.get("scopus_id",""), "observed_s2_id":item.get("s2_id",""), "observed_title": item["title"]})
+            provenance.append({"record_id": rid, **p, "observed_doi": item["doi"], "observed_openalex_id": item["openalex_id"], "observed_scopus_id": item.get("scopus_id",""), "observed_s2_id":item.get("s2_id",""), "observed_arxiv_id":item.get("arxiv_id",""), "observed_arxiv_related_doi":item.get("arxiv_related_doi",""), "observed_arxiv_version_url":item.get("arxiv_version_url",""), "observed_title": item["title"]})
     titles = defaultdict(list)
     for r in records:
         title = normalized_title(r["title"])
@@ -660,10 +800,12 @@ def merge(args):
     args.out.mkdir(parents=True, exist_ok=False)
     has_scopus = any("scopus_id" in i for i, _ in occurrences)
     has_s2 = any("s2_id" in i for i, _ in occurrences)
-    cols = COLS + (["scopus_id"] if has_scopus else []) + (["s2_id"] if has_s2 else [])
+    has_arxiv = any("arxiv_id" in i for i, _ in occurrences)
+    arxiv_cols=["arxiv_id","arxiv_related_doi","arxiv_version_url"] if has_arxiv else []
+    cols = COLS + (["scopus_id"] if has_scopus else []) + (["s2_id"] if has_s2 else []) + arxiv_cols
     csv_write(args.out / "records.csv", records, cols)
-    csv_write(args.out / "provenance.csv", provenance, ["record_id", "source", "query_id", "raw_path", "row", "sha256", "date_scope", "observed_doi", "observed_openalex_id", "observed_title"] + (["observed_scopus_id"] if has_scopus else []) + (["observed_s2_id"] if has_s2 else []))
-    csv_write(args.out / "identifier_conflicts.csv", conflicts, ["record_id", "dois", "openalex_ids", "status"] + (["scopus_ids"] if has_scopus else []) + (["s2_ids"] if has_s2 else []))
+    csv_write(args.out / "provenance.csv", provenance, ["record_id", "source", "query_id", "raw_path", "row", "sha256", "date_scope", "observed_doi", "observed_openalex_id", "observed_title"] + (["observed_scopus_id"] if has_scopus else []) + (["observed_s2_id"] if has_s2 else []) + ["observed_"+c for c in arxiv_cols])
+    csv_write(args.out / "identifier_conflicts.csv", conflicts, ["record_id", "dois", "openalex_ids", "status"] + (["scopus_ids"] if has_scopus else []) + (["s2_ids"] if has_s2 else []) + (["arxiv_ids"] if has_arxiv else []))
     csv_write(args.out / "version_candidates.csv", pairs, ["record_a", "record_b", "title", "year_a", "year_b", "status"])
     review_fields = ["reviewer_id", "decision", "exclusion_reason", "notes"]
     for stage in ("title_abstract", "full_text"):
@@ -719,6 +861,14 @@ def main(argv=None):
     sp.add_argument("--anonymous", action="store_true", help="Use public API without a key; shared rate limits apply.")
     sp.add_argument("--delay", type=float, default=1.1)
     sp.set_defaults(fn=s2_search)
+    sp = sub.add_parser("arxiv-search")
+    sp.add_argument("--config", type=Path, required=True)
+    sp.add_argument("--out", type=Path, required=True)
+    sp.add_argument("--only", action="append")
+    sp.add_argument("--max-pages", type=int, help="Pilot cap per query.")
+    sp.add_argument("--count", type=int, default=100)
+    sp.add_argument("--delay", type=float, default=3.1)
+    sp.set_defaults(fn=arxiv_search)
     args = p.parse_args(argv)
     if getattr(args, "max_pages", None) is not None and args.max_pages < 1:
         p.error("--max-pages must be positive")
