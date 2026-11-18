@@ -21,7 +21,7 @@ from xml.parsers import expat
 from collections import Counter, defaultdict
 from pathlib import Path
 
-VERSION = "0.6.1"
+VERSION = "0.7.0"
 API = "https://api.openalex.org/works"
 SCOPUS_API = "https://api.elsevier.com/content/search/scopus"
 S2_API = "https://api.semanticscholar.org/graph/v1/paper/search/bulk"
@@ -961,6 +961,8 @@ def chase(args):
 
 def read_run(run, allow_partial):
     m = json.loads((run / "manifest.json").read_text(encoding="utf-8"))
+    if m.get("kind") == "abstract_enrichment":
+        raise ValueError("Abstract enrichment is not a retrieval run; do not merge its responses into the search corpus.")
     if m["status"] != "complete" and not allow_partial:
         raise ValueError(f"Incomplete run: {run}; pass --allow-partial only for pilot exploration.")
     if digest((run / "config.json").read_bytes()) != m["config_sha256"]:
@@ -1120,6 +1122,125 @@ def merge(args):
     print(json.dumps(report, indent=2))
 
 
+def enrichment_identity(record, conflicts):
+    """Do not guess identities for conflicting clusters or unsafe filter values."""
+    d, w = doi(record.get("doi")), work_id(record.get("openalex_id"))
+    candidates = {doi(x) for x in record.get("dblp_doi_candidates", "").split(";") if doi(x)}
+    if record["record_id"] in conflicts or len(candidates) > 1 or (d and candidates and d not in candidates):
+        return "", "", "identity_conflict"
+    if d and not any(c in d for c in ',|"!+\\'):
+        return "doi", d, ""
+    if w:
+        return "openalex", w, ""
+    return "", "", "no_safe_identifier"
+
+
+def enrich_abstracts(args):
+    """Recover missing abstracts without changing corpus membership or identifiers."""
+    source = args.merged / "records.csv"
+    conflict_file = args.merged / "identifier_conflicts.csv"
+    source_hash, conflict_hash = file_digest(source), file_digest(conflict_file)
+    with source.open(encoding="utf-8-sig", newline="") as f:
+        reader = csv.DictReader(f); fields = list(reader.fieldnames or []); records = list(reader)
+    required = {"record_id", "title", "year", "doi", "openalex_id", "abstract"}
+    if not required <= set(fields) or len({r["record_id"] for r in records}) != len(records) or any(not r["record_id"] for r in records):
+        raise ValueError("Expected a merged records.csv with unique record IDs and standard columns.")
+    with conflict_file.open(encoding="utf-8-sig", newline="") as f:
+        conflicts = {r["record_id"] for r in csv.DictReader(f)}
+    missing = sorted((r for r in records if not r["abstract"].strip()), key=lambda r:r["record_id"])
+    result = {}
+    selected = defaultdict(list)
+    attempted = 0
+    for r in missing:
+        kind, ident, status = enrichment_identity(r, conflicts)
+        if not status and args.limit is not None and attempted >= args.limit:
+            status = "not_attempted_limit"
+        if not status:
+            attempted += 1
+            selected[kind].append((r,ident))
+            status = "pending"
+        result[r["record_id"]] = {"record_id":r["record_id"],"lookup_kind":kind,"lookup_id":ident,"status":status,"provider":"","provider_id":"","provider_doi":"","provider_title":"","provider_year":"","raw_path":"","raw_sha256":"","raw_row":"","recovered_abstract":"","openalex_status":"","crossref_status":""}
+    config = {"records_sha256":source_hash,"identifier_conflicts_sha256":conflict_hash,"limit":args.limit,"batch_size":args.batch_size,"crossref_fallback":args.crossref,"missing_before":len(missing),"selection":"sorted record ID; safe exact identifier only","acceptance":"single exact canonical DOI or OpenAlex ID, matching normalized title, consistent known year and identifiers"}
+    manifest = run_create(args.out,"abstract_enrichment",config)
+    oa = cross = None
+
+    def recover(provider, kind, items):
+        ids = sorted({ident for _,ident in items})
+        for offset in range(0,len(ids),args.batch_size):
+            batch=ids[offset:offset+args.batch_size]; chosen=set(batch)
+            if provider == "OpenAlex":
+                params={"filter":kind+":"+"|".join(batch),"per_page":100,"select":"id,doi,title,publication_year,abstract_inverted_index"}
+                data,body=oa.fetch(params)
+                if oa.key and oa.key.encode() in body:
+                    raise RuntimeError("OpenAlex response contains credential material; raw page not saved.")
+                rows=data.get("results"); count=(data.get("meta") or {}).get("count")
+                if not isinstance(rows,list) or not isinstance(count,int) or count!=len(rows):
+                    raise RuntimeError("Incomplete or malformed OpenAlex enrichment batch; no silent pagination truncation.")
+                normalized=[{"doi":doi(w.get("doi")),"openalex_id":work_id(w.get("id")),"title":w.get("title") or "","year":str(w.get("publication_year") or ""),"abstract":abstract(w.get("abstract_inverted_index"))} for w in rows]
+            else:
+                params={"filter":",".join("doi:"+d for d in batch),"rows":100}
+                data,body=cross.fetch(params); count,rows=crossref_page(data)
+                if count!=len(rows):
+                    raise RuntimeError("Incomplete Crossref enrichment batch; no silent pagination truncation.")
+                normalized=[normalize_crossref(w) for w in rows]
+            name=f"raw/{provider.lower()}-{kind}-{offset//args.batch_size+1:06}.json"
+            (args.out/name).write_bytes(body); sha=digest(body)
+            manifest["pages"].append({"provider":provider,"lookup_kind":kind,"lookup_ids":batch,"params":params,"path":name,"sha256":sha,"retrieved_utc":now(),"rows":len(rows)})
+            save_manifest(args.out,manifest)
+            index=defaultdict(list)
+            for i,w in enumerate(normalized,1):
+                lookup=w.get("openalex_id") if kind=="openalex" else w.get("doi")
+                if lookup in chosen: index[lookup].append((i,w))
+            for r,ident in items:
+                if ident not in chosen: continue
+                entry=result[r["record_id"]]; matches=index[ident]
+                status="no_exact_match" if not matches else "multiple_exact_matches" if len(matches)>1 else ""
+                if not status:
+                    i,w=matches[0]
+                    existing_d,existing_w=doi(r.get("doi")),work_id(r.get("openalex_id"))
+                    if (existing_d and w.get("doi") and existing_d!=w["doi"]) or (provider=="OpenAlex" and existing_w and w.get("openalex_id")!=existing_w):
+                        status="identifier_mismatch"
+                    elif not normalized_title(r["title"]) or normalized_title(r["title"])!=normalized_title(w["title"]):
+                        status="title_mismatch"
+                    elif r["year"] and w["year"] and r["year"]!=w["year"]:
+                        status="year_mismatch"
+                    elif not w["abstract"].strip(): status="abstract_absent"
+                    else: status="recovered"
+                    entry.update(provider_id=w.get("openalex_id") or w["doi"],provider_doi=w["doi"],provider_title=w["title"],provider_year=w["year"],raw_row=i,recovered_abstract=w["abstract"] if status=="recovered" else "")
+                else:
+                    entry.update(provider_id="",provider_doi="",provider_title="",provider_year="",raw_row="",recovered_abstract="")
+                entry.update(status=status,provider=provider,raw_path=name,raw_sha256=sha)
+                entry[provider.lower()+"_status"]=status
+            print(f"{provider} {kind}: {min(offset+len(batch),len(ids))}/{len(ids)} identifiers queried",flush=True)
+
+    status="failed_or_interrupted"
+    try:
+        oa = OpenAlex(key(), delay=args.delay, retries=0) if attempted else None
+        cross = Crossref(delay=max(2,args.delay)) if args.crossref else None
+        for kind,items in sorted(selected.items()): recover("OpenAlex",kind,items)
+        if cross:
+            fallback=[(r,ident) for r,ident in selected.get("doi",[]) if result[r["record_id"]]["status"] in ("no_exact_match","abstract_absent")]
+            if fallback: recover("Crossref","doi",fallback)
+        if file_digest(source)!=source_hash or file_digest(conflict_file)!=conflict_hash:
+            raise RuntimeError("Input merge changed during abstract enrichment.")
+        status="complete" if args.limit is None else "pilot_complete"
+    finally:
+        # Even on a rate/access failure, preserve the batch results and pending queue.
+        manifest["status"]=status; manifest["finished_utc"]=now()
+        save_manifest(args.out,manifest)
+        recovery=list(result.values())
+        recovery_fields=["record_id","lookup_kind","lookup_id","status","provider","provider_id","provider_doi","provider_title","provider_year","raw_path","raw_sha256","raw_row","recovered_abstract","openalex_status","crossref_status"]
+        csv_write(args.out/"abstract_recovery.csv",recovery,recovery_fields)
+        enriched=[]
+        for r in records:
+            entry=result.get(r["record_id"],{})
+            enrich_status=entry.get("status","original_abstract_present")
+            enriched.append({**r,"abstract":entry.get("recovered_abstract") or r["abstract"],"abstract_enrichment_status":enrich_status,"abstract_enrichment_source":entry.get("provider","") if enrich_status=="recovered" else "","abstract_enrichment_sha256":entry.get("raw_sha256","") if enrich_status=="recovered" else ""})
+        csv_write(args.out/"enriched_records.csv",enriched,fields+["abstract_enrichment_status","abstract_enrichment_source","abstract_enrichment_sha256"])
+        report={"tool_version":VERSION,"status":status,"input_clusters":len(records),"missing_before":len(missing),"selected_for_lookup":attempted,"status_counts":dict(Counter(r["status"] for r in recovery)),"recovered":sum(r["status"]=="recovered" for r in recovery),"missing_after":sum(not r["abstract"].strip() for r in enriched),"raw_batches":len(manifest["pages"]),"inclusion_count":None,"note":"Metadata enrichment only; no new corpus records, identifier links, or screening decisions."}
+        write_json(args.out/"report.json",report); print(json.dumps(report,indent=2))
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--version", action="version", version=VERSION)
@@ -1184,9 +1305,19 @@ def main(argv=None):
     sp.add_argument("--out", type=Path, required=True)
     sp.add_argument("--only", action="append")
     sp.set_defaults(fn=dblp_search)
+    sp = sub.add_parser("enrich-abstracts", help="Recover missing abstracts by exact identifiers; never add candidates.")
+    sp.add_argument("--merged", type=Path, required=True, help="Existing merge directory (records.csv and identifier_conflicts.csv).")
+    sp.add_argument("--out", type=Path, required=True)
+    sp.add_argument("--limit", type=int, help="Pilot maximum number of eligible missing-abstract records.")
+    sp.add_argument("--batch-size", type=int, default=25, choices=range(1,51), metavar="1..50")
+    sp.add_argument("--delay", type=float, default=1.1)
+    sp.add_argument("--crossref", action="store_true", help="For DOI matches absent from OpenAlex or lacking an abstract, query Crossref.")
+    sp.set_defaults(fn=enrich_abstracts)
     args = p.parse_args(argv)
     if getattr(args, "max_pages", None) is not None and args.max_pages < 1:
         p.error("--max-pages must be positive")
+    if getattr(args, "limit", None) is not None and args.limit < 1:
+        p.error("--limit must be positive")
     if not math.isfinite(getattr(args, "delay", 1.1)) or getattr(args, "delay", 1.1) < 1:
         p.error("--delay must be at least 1 second")
     try:
