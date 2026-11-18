@@ -174,6 +174,28 @@ py -m unittest discover -s tests -v
 
 Offline tests simulate OpenAlex, Scopus, Semantic Scholar, arXiv and Crossref responses and DBLP XML snapshots using synthetic metadata. A real connection or snapshot scan must be commissioned on the researcher's machine; passing tests do not establish API availability, query adequacy, retrieval recall, AI screening accuracy, or scientific inclusion. The toolkit does not currently implement AI screening, semantic embedding locally, the Web of Science API adapter, screening consensus, automatic BibTeX export, or automatic revision linking. These are planned extensions. Use human validation and disclose any later AI use. Preserve raw licensed files privately and release only permitted metadata.
 
+## Expanded coding-agent coverage pilot
+
+The supplementary configuration adds twelve Boolean query families, retaining the original date window and separating search coverage from study inclusion. It includes broad agent terminology, named tools, repair, feedback, test co-generation, security, semantic correctness, benchmarks, review, environments, coordination and artifact reproducibility.
+
+```powershell
+py slrkit.py search --config config/openalex-coverage-expansion-34.json --out runs/coverage-pilot --max-pages 1 --delay 2
+```
+
+Inspect provider-reported result counts, unique identifier yield and relevance before freezing the search. For a full run, use a new output directory and omit `--max-pages`. Never combine a capped pilot with its full rerun as if they were independent searches. Observe API access limits.
+
+## Claim-level evidence audit (experimental)
+
+`claim_audit.py` validates source-located JSONL claim records and compares paired outcomes with explicit missingness. Structural validity does not prove an item's eligibility, semantic correctness or scientific validity. Human adjudication fields remain explicit.
+
+```powershell
+py claim_audit.py validate claims.jsonl --out validation.json
+py claim_audit.py compare pairs.jsonl --out comparison.json
+py -m unittest discover -s tests -p test_claim_audit.py -v
+```
+
+A paired outcome example is `{"instance_id":"example","left":true,"right":null}`. Missing outcomes are not treated as failures. The importable helpers also support integer compatibility under rounded percentages, paired marginal and event-without-alert bounds, joint partitions and multi-configuration portfolio analysis. Bounds are not observed joint counts or confidence intervals. See the module docstrings and synthetic regression tests for the input contracts.
+
 ## Reproducibility and documentation
 
 - OpenAlex API: https://help.openalex.org/api/
