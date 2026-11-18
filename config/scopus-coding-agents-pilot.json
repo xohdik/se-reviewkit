@@ -1,0 +1,11 @@
+{
+  "status": "pilot; validate Scopus syntax, entitlement and coverage before formal retrieval",
+  "from_date": "2022-01-01",
+  "to_date": "2026-11-18",
+  "queries": [
+    {"id": "S01_agent_verification", "text": "TITLE-ABS-KEY((\"coding agent*\" OR \"code agent*\" OR \"software engineering agent*\" OR \"agentic software engineering\" OR \"autonomous coding\" OR \"SWE-bench\") AND (verif* OR validat* OR correct* OR assur* OR oracle* OR test* OR review*))"},
+    {"id": "S02_evaluation_integrity", "text": "TITLE-ABS-KEY((\"coding agent*\" OR \"software engineering agent*\" OR \"SWE-bench\" OR \"automated issue resolution\") AND (\"test overfitting\" OR \"reward hacking\" OR leak* OR contaminat* OR \"test manipulation\" OR \"benchmark validity\"))"},
+    {"id": "S03_repository_checks", "text": "TITLE-ABS-KEY((\"repository-level\" OR \"issue resolution\" OR \"patch generation\" OR \"program repair\") AND (agent* OR LLM*) AND (\"patch verification\" OR \"test generation\" OR \"regression test*\" OR \"patch correctness\" OR \"formal verification\"))"},
+    {"id": "S04_verifier_mechanisms", "text": "TITLE-ABS-KEY((\"coding agent*\" OR \"software engineering agent*\" OR \"SWE-bench\") AND (verifier* OR critic* OR reviewer* OR rubric* OR \"process reward\" OR \"test oracle*\" OR \"formal proof\"))"}
+  ]
+}

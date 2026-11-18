@@ -17,8 +17,9 @@ import urllib.request
 from collections import Counter, defaultdict
 from pathlib import Path
 
-VERSION = "0.1.1"
+VERSION = "0.2.0"
 API = "https://api.openalex.org/works"
+SCOPUS_API = "https://api.elsevier.com/content/search/scopus"
 FIELDS = "id,doi,title,publication_year,publication_date,authorships,primary_location,type,abstract_inverted_index,referenced_works,open_access"
 COLS = ["record_id", "title", "year", "publication_date", "doi", "openalex_id", "authors", "venue", "type", "abstract", "url", "sources", "query_ids", "occurrences"]
 
@@ -81,6 +82,62 @@ def normalize_work(work):
     }
 
 
+def scopus_id(value):
+    value = str(value or "").strip()
+    match = re.fullmatch(r"(?:2-s2\.0-|SCOPUS_ID:)?(\d+)", value, re.I)
+    return "2-s2.0-" + match.group(1) if match else ""
+
+
+def normalize_scopus(work):
+    sid = scopus_id(work.get("eid")) or scopus_id(work.get("dc:identifier"))
+    date = work.get("prism:coverDate") or ""
+    authors = work.get("author") or []
+    if isinstance(authors, dict):
+        authors = [authors]
+    names = "; ".join(str(a.get("authname") or a.get("surname") or "") for a in authors if isinstance(a, dict))
+    return {"title": work.get("dc:title") or "", "year": date[:4] if re.match(r"\d{4}", date) else "",
+        "publication_date": date, "doi": doi(work.get("prism:doi")), "openalex_id": "",
+        "scopus_id": sid, "authors": names.strip("; ") or work.get("dc:creator") or "",
+        "venue": work.get("prism:publicationName") or "", "type": work.get("subtypeDescription") or work.get("prism:aggregationType") or "",
+        "abstract": work.get("dc:description") or "", "url": ("https://doi.org/" + doi(work.get("prism:doi"))) if doi(work.get("prism:doi")) else
+        ("https://www.scopus.com/record/display.uri?eid=" + sid if sid else "")}
+
+
+class Scopus:
+    """Offset pagination for authorized Scopus Search API access."""
+    def __init__(self, key, delay=1.1, retries=3, timeout=40, insttoken=None):
+        self.key, self.delay, self.retries, self.timeout, self.insttoken = key, delay, retries, timeout, insttoken
+
+    def fetch(self, params):
+        url = SCOPUS_API + "?" + urllib.parse.urlencode(params)
+        headers = {"X-ELS-APIKey": self.key, "Accept": "application/json", "User-Agent": "SE-ReviewKit/" + VERSION}
+        if self.insttoken:
+            headers["X-ELS-Insttoken"] = self.insttoken
+        for n in range(self.retries + 1):
+            try:
+                with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=self.timeout) as response:
+                    body = response.read()
+                # Never persist reflected credentials in raw responses.
+                if any(secret and secret.encode() in body for secret in (self.key, self.insttoken)):
+                    raise RuntimeError("Scopus response contains credential material; raw page not saved.")
+                time.sleep(self.delay)
+                return json.loads(body), body
+            except urllib.error.HTTPError as exc:
+                status = exc.code
+                if status in (401, 403):
+                    raise RuntimeError(f"Scopus HTTP {status}: verify API entitlement and authorized institutional network; do not retry or purchase access.") from None
+                if status == 429:
+                    raise RuntimeError("Scopus HTTP 429: quota or throttling limit; stop and check account limits.") from None
+                if status not in (500, 502, 503, 504) or n == self.retries:
+                    raise RuntimeError(f"Scopus HTTP {status}: check API query syntax or service availability.") from None
+                time.sleep(min(60, 2 ** n))
+            except (urllib.error.URLError, TimeoutError, OSError):
+                if n == self.retries:
+                    raise RuntimeError("Scopus connection failed; check network access.") from None
+                time.sleep(min(60, 2 ** n))
+        raise AssertionError("unreachable")
+
+
 def csv_write(path, rows, fields):
     with path.open("w", encoding="utf-8-sig", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fields, extrasaction="ignore")
@@ -140,6 +197,99 @@ def run_create(out, kind, config):
 
 def save_manifest(out, manifest):
     write_json(out / "manifest.json", manifest)
+
+
+def scopus_page(data):
+    result = data.get("search-results")
+    if not isinstance(result, dict):
+        raise RuntimeError("Unexpected Scopus response: missing search-results.")
+    try:
+        total = int(result["opensearch:totalResults"])
+        start = int(result["opensearch:startIndex"])
+    except (KeyError, TypeError, ValueError):
+        raise RuntimeError("Unexpected Scopus response: missing pagination metadata.") from None
+    rows = result.get("entry") or []
+    if total == 0 and isinstance(rows, list) and len(rows) == 1 and isinstance(rows[0], dict) and "error" in rows[0]:
+        rows = []
+    if total < 0 or start < 0 or not isinstance(rows, list) or any(not isinstance(r, dict) or not r.get("dc:title") for r in rows):
+        raise RuntimeError("Unexpected Scopus response: invalid result records.")
+    return total, start, rows
+
+
+def retrieve_scopus(client, out, manifest, query_id, params, max_pages=None):
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", query_id):
+        raise ValueError("Invalid query identifier.")
+    entry = {"query_id":query_id,"params":params,"started_utc":now(),"hits_first_page":None,
+             "retrieved_occurrences":0,"pages":0,"status":"running"}
+    manifest["queries"].append(entry)
+    save_manifest(out, manifest)
+    offset, seen_ids = 0, set()
+    while True:
+        data, body = client.fetch({**params, "start":offset})
+        total, reported_start, rows = scopus_page(data)
+        if reported_start != offset or len(rows) > params["count"]:
+            raise RuntimeError("Scopus pagination mismatch; run not complete.")
+        if entry["pages"] == 0:
+            entry["hits_first_page"] = total
+        if total != entry["hits_first_page"]:
+            raise RuntimeError("Scopus reported hit count changed during pagination; run not complete.")
+        if offset + len(rows) > total or (not rows and offset < total):
+            raise RuntimeError("Scopus returned inconsistent page length; run not complete.")
+        page_ids = [scopus_id(r.get("eid")) or scopus_id(r.get("dc:identifier")) for r in rows]
+        ids = [s for s in page_ids if s]
+        if len(ids) != len(set(ids)) or seen_ids.intersection(ids):
+            raise RuntimeError("Scopus returned repeated document IDs within a query; run not complete.")
+        seen_ids.update(ids)
+        entry["pages"] += 1
+        entry["retrieved_occurrences"] += len(rows)
+        filename = f"raw/{query_id}-{entry['pages']:06d}.json"
+        (out / filename).write_bytes(body)
+        manifest["pages"].append({"query_id":query_id,"path":filename,"sha256":digest(body),"retrieved_utc":now(),"rows":len(rows)})
+        save_manifest(out, manifest)
+        print(f"{query_id}: page {entry['pages']}, {entry['retrieved_occurrences']}/{total} records", flush=True)
+        offset += len(rows)
+        if offset >= total:
+            entry["status"] = "exhausted"
+            break
+        if max_pages and entry["pages"] >= max_pages:
+            entry["status"] = "capped"
+            break
+        # Offset navigation is limited to 5,000 results; do not silently truncate.
+        if offset >= 5000 or total > 5000:
+            raise RuntimeError("Scopus offset limit: query exceeds 5,000 results. Stop; use authorized cursor access or prespecified year partitions.")
+    entry["finished_utc"] = now()
+    save_manifest(out, manifest)
+
+
+def scopus_search(args):
+    config = json.loads(args.config.read_text(encoding="utf-8"))
+    start, end = config["from_date"], config["to_date"]
+    if dt.date.fromisoformat(start) > dt.date.fromisoformat(end):
+        raise ValueError("Invalid date range.")
+    selected = [q for q in config["queries"] if not args.only or q["id"] in args.only]
+    if not selected or len({q["id"] for q in selected}) != len(selected) or (args.only and set(args.only) != {q["id"] for q in selected}):
+        raise ValueError("Need distinct known query IDs.")
+    if not 1 <= args.count <= (25 if args.view == "COMPLETE" else 200):
+        raise ValueError("Page size outside allowed range for selected Scopus view.")
+    config["queries"] = selected
+    config["view"] = args.view
+    config["count"] = args.count
+    config["date_filter_granularity"] = "year"
+    secret = os.environ.get("SCOPUS_API_KEY") or getpass.getpass("Scopus API key (hidden): ")
+    if not secret.strip():
+        raise ValueError("Scopus API key required.")
+    client = Scopus(secret.strip(), delay=args.delay, insttoken=os.environ.get("SCOPUS_INST_TOKEN"))
+    manifest = run_create(args.out, "scopus_search", config)
+    try:
+        for q in selected:
+            retrieve_scopus(client,args.out,manifest,q["id"],{"query":q["text"],"date":f"{start[:4]}-{end[:4]}","view":args.view,"count":args.count},args.max_pages)
+        manifest["status"] = "complete" if all(q["status"] == "exhausted" for q in manifest["queries"]) else "partial_capped"
+    except (Exception, KeyboardInterrupt):
+        manifest["status"] = "failed_or_interrupted"
+        raise
+    finally:
+        manifest["finished_utc"] = now()
+        save_manifest(args.out, manifest)
 
 
 def retrieve(client, out, manifest, query_id, params, max_pages=None):
@@ -272,14 +422,19 @@ def read_run(run, allow_partial):
         if digest(body) != p["sha256"]:
             raise ValueError(f"Page checksum mismatch: {path}")
         data = json.loads(body)
-        if len(data["results"]) != p["rows"]:
+        is_scopus = m.get("kind") == "scopus_search"
+        results = scopus_page(data)[2] if is_scopus else data["results"]
+        if len(results) != p["rows"]:
             raise ValueError(f"Page count mismatch: {path}")
-        for i, work in enumerate(data["results"], 1):
-            date = work.get("publication_date") or ""
+        for i, work in enumerate(results, 1):
+            item = normalize_scopus(work) if is_scopus else normalize_work(work)
+            date = item.get("publication_date") or ""
             scope = "unknown"
             if config.get("from_date") and config.get("to_date") and re.fullmatch(r"\d{4}-\d{2}-\d{2}", date):
                 scope = "in_window" if config["from_date"] <= date <= config["to_date"] else "outside_window"
-            yield normalize_work(work), {"source": "OpenAlex", "query_id": p["query_id"], "raw_path": str(path), "row": i, "sha256": p["sha256"], "date_scope": scope}
+                if is_scopus:
+                    scope = "cover_date_" + scope
+            yield item, {"source": "Scopus" if is_scopus else "OpenAlex", "query_id": p["query_id"], "raw_path": str(path), "row": i, "sha256": p["sha256"], "date_scope": scope}
 
 
 def read_csv(source, path):
@@ -290,6 +445,8 @@ def read_csv(source, path):
             def get(*names):
                 return next((fields[n] for n in names if fields.get(n)), "")
             item = {"title": get("title", "article title", "document title"), "year": get("year", "publication year", "pubyear"), "publication_date": get("publication date", "publication_date"), "doi": doi(get("doi", "digital object identifier")), "openalex_id": work_id(get("openalex_id")), "authors": get("authors", "author", "author full names"), "venue": get("source title", "venue", "publication title", "journal"), "type": get("document type", "type"), "abstract": get("abstract"), "url": get("url", "link", "document url")}
+            if source.casefold() == "scopus":
+                item["scopus_id"] = scopus_id(get("eid", "scopus_id", "scopus id"))
             if not item["title"]:
                 raise ValueError(f"Missing title at {path}:row {i}")
             yield item, {"source": source, "query_id": "institutional_export", "raw_path": str(path), "row": i, "sha256": file_hash, "date_scope": "not_evaluated"}
@@ -306,15 +463,15 @@ def consolidate(occurrences):
         return i
     seen = {}
     for i, (item, provenance) in enumerate(occurrences):
-        for name in ("doi", "openalex_id"):
-            if item[name]:
+        for name in ("doi", "openalex_id", "scopus_id"):
+            if item.get(name):
                 k = (name, item[name])
                 if k in seen:
                     a, b = find(i), find(seen[k])
                     parent[max(a, b)] = min(a, b)
                 else:
                     seen[k] = i
-        if not item["doi"] and not item["openalex_id"]:
+        if not any(item.get(name) for name in ("doi","openalex_id","scopus_id")):
             k = ("exact_occurrence", provenance["source"], provenance["sha256"], provenance["row"])
             if k in seen:
                 a, b = find(i), find(seen[k])
@@ -328,15 +485,18 @@ def consolidate(occurrences):
     for group in groups.values():
         ids = sorted({i["doi"] for i, _ in group if i["doi"]})
         wids = sorted({i["openalex_id"] for i, _ in group if i["openalex_id"]})
-        signature = ids + wids or sorted({p["source"] + ":" + p["sha256"] + ":" + str(p["row"]) for _, p in group})
+        sids = sorted({i["scopus_id"] for i, _ in group if i.get("scopus_id")})
+        signature = ids + wids + sids or sorted({p["source"] + ":" + p["sha256"] + ":" + str(p["row"]) for _, p in group})
         rid = "R-" + digest(";".join(signature).encode())[:20]
         row = {k: max((i[k] for i, _ in group), key=lambda v: (len(v), v)) for k in COLS if k in group[0][0]}
+        if any("scopus_id" in i for i, _ in group):
+            row["scopus_id"] = ";".join(sids)
         row.update(record_id=rid, sources=";".join(sorted({p["source"] for _, p in group})), query_ids=";".join(sorted({p["query_id"] for _, p in group})), occurrences=len(group))
         records.append(row)
-        if len(ids) > 1 or len(wids) > 1:
-            conflicts.append({"record_id": rid, "dois": ";".join(ids), "openalex_ids": ";".join(wids), "status": "needs_adjudication"})
+        if len(ids) > 1 or len(wids) > 1 or len(sids) > 1:
+            conflicts.append({"record_id": rid, "dois": ";".join(ids), "openalex_ids": ";".join(wids), "scopus_ids": ";".join(sids), "status": "needs_adjudication"})
         for item, p in group:
-            provenance.append({"record_id": rid, **p, "observed_doi": item["doi"], "observed_openalex_id": item["openalex_id"], "observed_title": item["title"]})
+            provenance.append({"record_id": rid, **p, "observed_doi": item["doi"], "observed_openalex_id": item["openalex_id"], "observed_scopus_id": item.get("scopus_id",""), "observed_title": item["title"]})
     titles = defaultdict(list)
     for r in records:
         title = normalized_title(r["title"])
@@ -364,13 +524,15 @@ def merge(args):
         raise ValueError("No records to consolidate.")
     records, provenance, conflicts, pairs = consolidate(occurrences)
     args.out.mkdir(parents=True, exist_ok=False)
-    csv_write(args.out / "records.csv", records, COLS)
-    csv_write(args.out / "provenance.csv", provenance, ["record_id", "source", "query_id", "raw_path", "row", "sha256", "date_scope", "observed_doi", "observed_openalex_id", "observed_title"])
-    csv_write(args.out / "identifier_conflicts.csv", conflicts, ["record_id", "dois", "openalex_ids", "status"])
+    has_scopus = any("scopus_id" in i for i, _ in occurrences)
+    cols = COLS + (["scopus_id"] if has_scopus else [])
+    csv_write(args.out / "records.csv", records, cols)
+    csv_write(args.out / "provenance.csv", provenance, ["record_id", "source", "query_id", "raw_path", "row", "sha256", "date_scope", "observed_doi", "observed_openalex_id", "observed_title"] + (["observed_scopus_id"] if has_scopus else []))
+    csv_write(args.out / "identifier_conflicts.csv", conflicts, ["record_id", "dois", "openalex_ids", "status"] + (["scopus_ids"] if has_scopus else []))
     csv_write(args.out / "version_candidates.csv", pairs, ["record_a", "record_b", "title", "year_a", "year_b", "status"])
     review_fields = ["reviewer_id", "decision", "exclusion_reason", "notes"]
     for stage in ("title_abstract", "full_text"):
-        csv_write(args.out / (stage + "_screening.csv"), records, COLS + review_fields)
+        csv_write(args.out / (stage + "_screening.csv"), records, cols + review_fields)
     evidence = ["claim_id", "record_id", "study_family_id", "rq", "artifact", "property", "mechanism", "oracle", "independence", "outcome", "value", "unit", "numerator", "denominator", "comparator", "source_locator", "source_url", "interpretation_limit", "reviewer_id", "validation_status"]
     csv_write(args.out / "evidence_claims.csv", [], evidence)
     source_sets = {r["record_id"]: set(r["sources"].split(";")) for r in records}
@@ -405,6 +567,15 @@ def main(argv=None):
     sp.add_argument("--allow-partial", action="store_true")
     sp.add_argument("--out", type=Path, required=True)
     sp.set_defaults(fn=merge)
+    sp = sub.add_parser("scopus-search")
+    sp.add_argument("--config", type=Path, required=True)
+    sp.add_argument("--out", type=Path, required=True)
+    sp.add_argument("--only", action="append")
+    sp.add_argument("--max-pages", type=int, help="Pilot cap per query.")
+    sp.add_argument("--view", choices=["STANDARD","COMPLETE"], default="STANDARD")
+    sp.add_argument("--count", type=int, default=25)
+    sp.add_argument("--delay", type=float, default=1.1)
+    sp.set_defaults(fn=scopus_search)
     args = p.parse_args(argv)
     if getattr(args, "max_pages", None) is not None and args.max_pages < 1:
         p.error("--max-pages must be positive")

@@ -2,7 +2,7 @@
 
 **Auditable literature retrieval and evidence management for software engineering systematic reviews.**
 
-Version 0.1.1 — research prototype. Python 3.10 or newer; no third-party packages. No account credentials, private manuscript, paid publisher exports, or review outcomes are included.
+Version 0.2.0 — research prototype. Python 3.10 or newer; no third-party packages. No account credentials, private manuscript, paid publisher exports, or review outcomes are included.
 
 ## Quick start (Windows PowerShell)
 
@@ -29,6 +29,29 @@ py slrkit.py merge --run runs/pilot-01 --run runs/pilot-semantic-02 --allow-part
 Use a fresh output folder if any of these names already exist. To recover the four Boolean pages alone, omit the second `--run` argument. `--allow-partial` is intentional for the old failed and capped pilot; this is not a formal search.
 
 On macOS/Linux use `python3` instead of `py`. An optional `OPENALEX_API_KEY` environment variable supports non-interactive execution. Never put keys on command lines or in committed config. User quotas still apply: review https://openalex.org/settings before scaling. The client defaults to a conservative 1.1-second delay between calls, retries transient failures, and stops on non-retryable HTTP errors. The official current limits and quotas can change.
+
+### Scopus API (v0.2.0)
+
+An Elsevier API key is not proof of data entitlement; use only an authorized academic account and institutional network or approved institutional token. Check https://dev.elsevier.com/academic_research_scopus.html and your institution's agreement before retrieval or sharing. Never purchase access solely to run this toolkit. Start with one query and one STANDARD page to check permission:
+
+```powershell
+py slrkit.py scopus-search --config config/scopus-coding-agents-pilot.json --only S01_agent_verification --out runs/scopus-check-01 --max-pages 1
+py slrkit.py merge --run runs/scopus-check-01 --allow-partial --out outputs/scopus-check-01
+```
+
+Enter the Scopus key at the hidden prompt. Optional environment variables are `SCOPUS_API_KEY` and `SCOPUS_INST_TOKEN` (only use an institution-issued token). Do not paste credentials into the config. A 401/403 stops the run; check entitlement with your library or Elsevier. A 429 stops rather than retrying through a quota.
+
+After a successful pilot, run the four-query example using `--max-pages 1` in a new directory. The default STANDARD view may return little or no abstract text; retain such records for review and obtain abstracts through permitted sources. If authorized, `--view COMPLETE` requests richer metadata (maximum 25 records per page). STANDARD supports up to 200 with `--count`; check the account's actual limits. Omit the pilot cap only after checking query coverage and entitlement. Offset pagination is capped at 5,000 results per query; the tool refuses to mark larger queries complete. Use authorized cursor retrieval (not implemented) or protocol-defined, non-overlapping year partitions if necessary and permitted.
+
+Scopus server-side date filtering is year-granularity; the returned cover date is not necessarily first publication date. Provenance flags the cover date against the requested window; human date adjudication is still required. The raw query pages and provider hit counts are kept in the run directory. The merge links DOI, OpenAlex IDs and Scopus EIDs and preserves source-specific IDs in mixed-source outputs. Use a new merge directory; record IDs may change when new identifiers are linked.
+
+Example after successful, uncapped retrieval:
+
+```powershell
+py slrkit.py merge --run runs/formal-01 --run runs/scopus-full-01 --out outputs/corpus-02
+```
+
+Do not redistribute licensed raw responses or abstracts without permission. Share only permissible aggregate statistics initially, and validate the data-use policy before transferring raw material to another service.
 
 ## Workflow
 
@@ -58,10 +81,10 @@ py slrkit.py merge --run runs/formal-01 --run runs/chase-01 --csv "Scopus=privat
 | File | Function |
 |---|---|
 | `manifest.json` and `config.json` | Query and run provenance, completion state, hashes |
-| `raw/*.json` | Original OpenAlex responses |
+| `raw/*.json` | Original API responses (keep licensed data private) |
 | `records.csv` | Identifier-linked candidate clusters |
 | `provenance.csv` | Every retrieval occurrence, source, original row location and date-scope flag |
-| `identifier_conflicts.csv` | Distinct DOI or OpenAlex IDs linked into a candidate cluster; requires adjudication |
+| `identifier_conflicts.csv` | Distinct DOI, OpenAlex IDs or Scopus EIDs linked into a candidate cluster; requires adjudication |
 | `version_candidates.csv` | Exact normalized-title matches with separate ID clusters; never silently merged |
 | `*_screening.csv` | Blank human screening worksheets |
 | `evidence_claims.csv` | Blank source-located evidence schema |
@@ -77,11 +100,13 @@ Source-exclusive candidate counts and overlaps support a later **coverage audit*
 py -m unittest discover -s tests -v
 ```
 
-Offline tests simulate the OpenAlex API and synthetic metadata. A real authenticated connection must be commissioned on the researcher's network; passing tests do not establish API availability, query adequacy, retrieval recall, AI screening accuracy, or scientific inclusion. The toolkit does not currently implement AI screening, semantic embedding locally, publisher-specific API adapters, screening consensus, automatic BibTeX export, or automatic revision linking. These are planned extensions. Use human validation and disclose any later AI use. Preserve raw licensed files privately and release only permitted metadata.
+Offline tests simulate OpenAlex and Scopus responses and synthetic metadata. A real authenticated connection must be commissioned on the researcher's network; passing tests do not establish API availability, query adequacy, retrieval recall, AI screening accuracy, or scientific inclusion. The toolkit does not currently implement AI screening, semantic embedding locally, Web of Science or Semantic Scholar API adapters, screening consensus, automatic BibTeX export, or automatic revision linking. These are planned extensions. Use human validation and disclose any later AI use. Preserve raw licensed files privately and release only permitted metadata.
 
 ## Reproducibility and documentation
 
 - OpenAlex API: https://help.openalex.org/api/
+- Scopus Search API: https://dev.elsevier.com/documentation/ScopusSearchAPI.wadl
+- Scopus access and quotas: https://dev.elsevier.com/api_key_settings.html
 - Search and cursor paging: https://help.openalex.org/api/searching/ and https://help.openalex.org/api/paging/
 - Citation chasing: https://help.openalex.org/how-to/api-recipes/
 - PRISMA-S: https://doi.org/10.1186/s13643-020-01542-z

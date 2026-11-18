@@ -2,8 +2,10 @@ import csv
 import json
 import tempfile
 import unittest
+import urllib.error
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import slrkit as kit
 
@@ -27,6 +29,102 @@ class MockClient:
 
 def page(results, cursor=None, count=3):
     return {"meta": {"count": count, "next_cursor": cursor}, "results": results}
+
+
+def scopus_work(eid, title="A paper", d=None):
+    return {"eid": "2-s2.0-" + str(eid), "dc:title": title,
+            "prism:doi": d, "prism:coverDate": "2025-06-01",
+            "dc:creator": "A. Author", "prism:publicationName": "Example"}
+
+
+def scopus_page(results, start, count):
+    return {"search-results":{"opensearch:totalResults":str(count),
+            "opensearch:startIndex":str(start), "entry":results}}
+
+
+class ScopusTests(unittest.TestCase):
+    def test_key_sent_only_in_header_and_not_persisted(self):
+        mock = SimpleNamespace()
+        response = scopus_page([scopus_work(1)],0,1)
+        from unittest.mock import MagicMock
+        proxy = MagicMock()
+        proxy.__enter__.return_value.read.return_value = kit.json_bytes(response)
+        with patch("slrkit.urllib.request.urlopen",return_value=proxy) as fetch, patch("slrkit.time.sleep"):
+            client = kit.Scopus("private-test-key",insttoken="private-token")
+            _, body = client.fetch({"query":"TITLE(example)","start":0})
+            request = fetch.call_args.args[0]
+            self.assertNotIn("private-test-key",request.full_url)
+            self.assertEqual(request.get_header("X-els-apikey"),"private-test-key")
+            self.assertEqual(request.get_header("X-els-insttoken"),"private-token")
+            self.assertNotIn(b"private-test-key",body)
+            proxy.__enter__.return_value.read.return_value=b'{"echo":"private-test-key"}'
+            with self.assertRaisesRegex(RuntimeError,"credential material"):
+                client.fetch({"query":"TITLE(example)"})
+
+    def test_entitlement_and_quota_fail_closed(self):
+        for status in (401,403,429):
+            error = urllib.error.HTTPError("https://api.elsevier.com",status,"test",{},None)
+            with patch("slrkit.urllib.request.urlopen",side_effect=error) as fetch:
+                with self.assertRaisesRegex(RuntimeError,str(status)):
+                    kit.Scopus("private-test-key").fetch({"query":"TITLE(example)"})
+                self.assertEqual(fetch.call_count,1)
+
+    def test_mixed_sources_and_same_eid_no_doi(self):
+        with tempfile.TemporaryDirectory() as d:
+            base = Path(d)
+            run = base / "scopus"
+            m = kit.run_create(run,"scopus_search",{"from_date":"2022-01-01","to_date":"2026-11-18"})
+            mock = MockClient([scopus_page([scopus_work(1,d="10.1234/a")],0,2),
+                               scopus_page([scopus_work(2)],1,2),
+                               scopus_page([scopus_work(2)],0,1)])
+            kit.retrieve_scopus(mock,run,m,"S1",{"count":1},None)
+            kit.retrieve_scopus(mock,run,m,"S2",{"count":1},None)
+            m["status"]="complete"
+            kit.save_manifest(run,m)
+            self.assertEqual(mock.calls[1][0]["start"],1)
+            oa=base/"oa"
+            kit.execute_run(oa,"search",{},[("Q",{})],MockClient([page([work("W1","A paper","10.1234/a")])]),None)
+            args=SimpleNamespace(run=[oa,run],csv=[],allow_partial=False,out=base/"merged")
+            kit.merge(args)
+            report=json.loads((args.out/"report.json").read_text())
+            self.assertEqual(report["retrieval_occurrences"],4)
+            self.assertEqual(report["identifier_clusters"],2)
+            self.assertEqual(report["source_overlap"]["OpenAlex"]["Scopus"],1)
+            rows=list(kit.read_run(run,False))
+            self.assertEqual(rows[0][1]["date_scope"],"cover_date_in_window")
+            with (args.out/"records.csv").open(encoding="utf-8-sig") as f:
+                merged=list(csv.DictReader(f))
+            self.assertEqual({r["scopus_id"] for r in merged},{"2-s2.0-1","2-s2.0-2"})
+
+    def test_zero_results(self):
+        self.assertEqual(kit.scopus_page(scopus_page([{"error":"Result set was empty"}],0,0))[2],[])
+
+    def test_capped_and_offset_limit(self):
+        with tempfile.TemporaryDirectory() as d:
+            run=Path(d)/"r"
+            m=kit.run_create(run,"scopus_search",{})
+            result=scopus_page([scopus_work(1)],0,6000)
+            kit.retrieve_scopus(MockClient([result]),run,m,"S1",{"count":1},1)
+            self.assertEqual(m["queries"][0]["status"],"capped")
+            with self.assertRaisesRegex(RuntimeError,"offset limit"):
+                kit.retrieve_scopus(MockClient([result]),run,m,"S2",{"count":1},None)
+
+    def test_repeated_id_or_changed_total_fails(self):
+        with tempfile.TemporaryDirectory() as d:
+            run=Path(d)/"r"
+            m=kit.run_create(run,"scopus_search",{})
+            with self.assertRaisesRegex(RuntimeError,"repeated document IDs"):
+                kit.retrieve_scopus(MockClient([scopus_page([scopus_work(1)],0,2),
+                    scopus_page([scopus_work(1)],1,2)]),run,m,"S1",{"count":1},None)
+            with self.assertRaisesRegex(RuntimeError,"hit count changed"):
+                kit.retrieve_scopus(MockClient([scopus_page([scopus_work(1)],0,2),
+                    scopus_page([scopus_work(2)],1,3)]),run,m,"S2",{"count":1},None)
+
+    def test_scopus_identifier_conflict(self):
+        rows=[(kit.normalize_scopus(scopus_work(s,d="10.1234/a")),
+            {"source":"Scopus","query_id":"S","sha256":"x","row":s}) for s in (1,2)]
+        _, _, conflicts, _=kit.consolidate(rows)
+        self.assertEqual(conflicts[0]["scopus_ids"],"2-s2.0-1;2-s2.0-2")
 
 
 class ToolkitTests(unittest.TestCase):
