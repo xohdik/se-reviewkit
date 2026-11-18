@@ -2,7 +2,7 @@
 
 **Auditable literature retrieval and evidence management for software engineering systematic reviews.**
 
-Version 0.7.0 — research prototype. Python 3.10 or newer; no third-party packages. No account credentials, private manuscript, paid publisher exports, or review outcomes are included.
+Version 0.7.1 — research prototype. Python 3.10 or newer; no third-party packages. No account credentials, private manuscript, paid publisher exports, or review outcomes are included.
 
 ## Quick start (Windows PowerShell)
 
@@ -135,7 +135,18 @@ py slrkit.py enrich-abstracts --merged outputs/merged --out outputs/abstract-ful
 
 The original merged files are never modified. The tool accepts an abstract only for a single exact canonical DOI or OpenAlex ID match, matching normalized title and compatible known publication year and identifiers. Conflicted clusters, ambiguous matches, identifier/title/year disagreements, unsafe or missing identifiers, and unavailable abstracts remain visible rather than being guessed. A DOI filter can return a work associated with a different canonical DOI; such an association is not treated as an exact canonical match. A match does not establish peer-review status or full-text eligibility.
 
-Outputs: `enriched_records.csv` (same IDs and row count, recovered abstracts and source/hash/status columns), `abstract_recovery.csv` (one row per initially missing abstract, including unresolved and unattempted records), `report.json`, and checksummed raw responses and manifest. On access/rate failure, the command stops and preserves completed batch results and pending statuses; rerun into a new directory after resolving access. Do not merge enrichment responses as new search records. The 50-record pilot is sorted by stable record ID, not a representative sample. Preserve the original merge and review metadata permissions before redistribution. The tool cannot guarantee an abstract exists in either provider. It does not purchase API access or retry OpenAlex quota failures during enrichment.
+Outputs: `enriched_records.csv` (same IDs and row count, recovered abstracts and source/hash/status columns), `abstract_recovery.csv` (one row per initially missing abstract, including unresolved and unattempted records), `report.json`, and checksummed raw responses and manifest. On access/rate failure, the command stops and preserves completed batch results and pending statuses. Do not merge enrichment responses as new search records. The 50-record pilot is sorted by stable record ID, not a representative sample. Preserve the original merge and review metadata permissions before redistribution. The tool cannot guarantee an abstract exists in either provider. It does not purchase API access or retry OpenAlex quota failures during enrichment.
+
+### Resume interrupted enrichment (v0.7.1)
+
+Keep the original merged directory and previous enrichment output unchanged. Resume into a fresh output directory, optionally limiting the next chunk or reducing the request batch size after a server error:
+
+```powershell
+py slrkit.py enrich-abstracts --merged outputs/merged --resume-from outputs/abstract-full --out outputs/abstract-resume-01 --limit 100 --batch-size 10 --delay 2 --crossref
+py slrkit.py enrich-abstracts --merged outputs/merged --resume-from outputs/abstract-resume-01 --out outputs/abstract-resume-02 --limit 100 --batch-size 10 --delay 2 --crossref
+```
+
+Resume verifies the original input hashes, previous config hash and raw response checksums, then replays successful batches (including empty results and prior Crossref fallback) without a new request. It works with v0.7.0 enrichment checkpoints. `--limit` caps new distinct OpenAlex lookup identifiers per invocation; `--batch-size` caps identifiers in one API request. Omit `--limit` to finish all remaining OpenAlex lookups. Crossref fallback may also process earlier OpenAlex results that have not yet been checked there. The new directory contains cumulative results, and the prior directory is preserved. If a request fails, stop and review the error, then resume the latest checkpoint into another new directory. Do not retry authorization or quota errors without resolving access. A completed run can still contain unresolved metadata; it is not an inclusion decision.
 
 ## Outputs and interpretation
 
