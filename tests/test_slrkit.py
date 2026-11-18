@@ -458,6 +458,22 @@ class DblpTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError,"Unexpected external"):
                 kit.stream_dblp(snapshot,dtd,lambda *args: None)
 
+    def test_segmented_scan_matches_unsegmented(self):
+        import gzip
+        with tempfile.TemporaryDirectory() as d:
+            base=Path(d); snapshot=base/"dblp.xml.gz"; dtd=base/"dblp.dtd"
+            dtd.write_text('<!ENTITY eacute "&#233;">')
+            records=[f'<article key="journals/x/{i}"><title>Coding agent <i>verification</i> {i}</title><author>Ren&eacute;</author><year>2025</year></article>' for i in range(900)]
+            records.insert(120,'<www key="home/x"><title>Ignored</title></www>')
+            xml=('<?xml version="1.0" encoding="ISO-8859-1"?><!DOCTYPE dblp SYSTEM "dblp-2023-06-28.dtd"><dblp>\n'+'\n'.join(records)+'\n</dblp>').encode("ascii")
+            with gzip.open(snapshot,"wb") as f:
+                f.write(xml)
+            a=[]; b=[]
+            self.assertEqual(kit.stream_dblp(snapshot,dtd,lambda r,i:a.append((r,i)),segment_limit=1024),900)
+            self.assertEqual(kit.stream_dblp(snapshot,dtd,lambda r,i:b.append((r,i))),900)
+            self.assertEqual(a,b)
+            self.assertEqual(a[-1][0]["fields"]["author"],["René"])
+
 
 if __name__ == "__main__":
     unittest.main()

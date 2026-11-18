@@ -2,7 +2,7 @@
 
 **Auditable literature retrieval and evidence management for software engineering systematic reviews.**
 
-Version 0.6.0 — research prototype. Python 3.10 or newer; no third-party packages. No account credentials, private manuscript, paid publisher exports, or review outcomes are included.
+Version 0.6.1 — research prototype. Python 3.10 or newer; no third-party packages. No account credentials, private manuscript, paid publisher exports, or review outcomes are included.
 
 ## Quick start (Windows PowerShell)
 
@@ -121,6 +121,8 @@ py slrkit.py dblp-search --config config/coding-agents-pilot.json --snapshot "C:
 ```
 
 The parser streams the compressed XML without expanding it to disk or loading the entire catalogue into memory. It resolves only the explicitly supplied local DTD (no network accesses), checksums both input files, retains matched records and source query provenance, reports publications scanned, and uses exact DBLP record keys and unambiguous DOI identity for linking. Multiple DOI candidates remain flagged for adjudication. Use a fixed snapshot DOI for reproducibility and record that the snapshot may predate the review's date cutoff. No payment or API key is required. Do not claim matched title records are included studies.
+
+Version 0.6.1 uses bounded XML parser segments, restarting only at verified top-level publication boundaries, to avoid the Expat 2 GiB document-index limitation seen on some Windows builds. If a prior scan failed, retain the failed manifest and rerun into a fresh output directory with the same snapshot and DTD. The previous partial scan must not be treated as complete.
 
 ## Outputs and interpretation
 

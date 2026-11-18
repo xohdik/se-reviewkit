@@ -21,7 +21,7 @@ from xml.parsers import expat
 from collections import Counter, defaultdict
 from pathlib import Path
 
-VERSION = "0.6.0"
+VERSION = "0.6.1"
 API = "https://api.openalex.org/works"
 SCOPUS_API = "https://api.elsevier.com/content/search/scopus"
 S2_API = "https://api.semanticscholar.org/graph/v1/paper/search/bulk"
@@ -182,14 +182,15 @@ def title_matcher(text):
     return matcher
 
 
-def stream_dblp(path,dtd,on_record):
+def stream_dblp(path,dtd,on_record,segment_limit=64*1024*1024):
     # Only the explicitly supplied local DBLP DTD may be resolved; no network.
     dtd_bytes=dtd.read_bytes()
     if not dtd_bytes or len(dtd_bytes)>1000000:
         raise ValueError("Invalid DBLP DTD size.")
-    parser=expat.ParserCreate()
-    parser.SetParamEntityParsing(expat.XML_PARAM_ENTITY_PARSING_ALWAYS)
+    parser=None
     depth=0; current=None; field=None; chunks=[]; count=0; loaded=False
+    encoding="UTF-8"
+    has_dtd=False
     kinds={"article","inproceedings","proceedings","book","incollection","phdthesis","mastersthesis","data"}
     fields={"title","year","author","editor","journal","booktitle","ee"}
     def external(context,base,system,public):
@@ -201,6 +202,17 @@ def stream_dblp(path,dtd,on_record):
         child.ExternalEntityRefHandler=lambda *args: 0
         child.Parse(dtd_bytes,True)
         return 1
+    def xml_decl(version,declared,standalone):
+        nonlocal encoding
+        if declared:
+            if declared.lower() not in ("utf-8","us-ascii","ascii","iso-8859-1","latin-1"):
+                raise ValueError("Unsupported encoding for segmented DBLP snapshot parsing.")
+            encoding=declared
+    def doctype(name,system,public,internal):
+        nonlocal has_dtd
+        if name!="dblp" or internal or public or not re.fullmatch(r"dblp(?:-\d{4}-\d{2}-\d{2})?\.dtd",system or ""):
+            raise ValueError("Unexpected external XML entity or unsupported DBLP DOCTYPE.")
+        has_dtd=True
     def start(name,attrs):
         nonlocal depth,current,field,chunks
         depth+=1
@@ -220,13 +232,47 @@ def stream_dblp(path,dtd,on_record):
         if depth==2 and current is not None:
             count+=1; on_record(current,count); current=None
         depth-=1
-    parser.StartElementHandler=start; parser.EndElementHandler=end; parser.CharacterDataHandler=chars
-    parser.ExternalEntityRefHandler=external
+    def create_parser():
+        nonlocal parser,loaded
+        loaded=False
+        parser=expat.ParserCreate()
+        parser.SetParamEntityParsing(expat.XML_PARAM_ENTITY_PARSING_ALWAYS)
+        parser.StartElementHandler=start; parser.EndElementHandler=end; parser.CharacterDataHandler=chars
+        parser.ExternalEntityRefHandler=external
+        parser.XmlDeclHandler=xml_decl; parser.StartDoctypeDeclHandler=doctype
+    create_parser()
+    # Windows Expat builds have had a 2 GiB total-input counter limit. Reset
+    # the parser well below this bound, ONLY at verified top-level boundaries.
+    tags=sorted(kinds|{"www","person","reference"})
+    boundary=re.compile(rb"</(?:"+b"|".join(t.encode() for t in tags)+rb")\s*>")
+    segment_bytes=0; segments=1
     with gzip.open(path,"rb") if path.suffix.lower()==".gz" else path.open("rb") as source:
         try:
-            parser.ParseFile(source)
+            while True:
+                data=source.read(4*1024*1024)
+                if not data:
+                    break
+                while data:
+                    split=boundary.search(data,max(0,segment_limit-segment_bytes)) if segment_bytes+len(data)>segment_limit else None
+                    if split is None:
+                        parser.Parse(data,False)
+                        segment_bytes+=len(data)
+                        if segment_bytes>segment_limit+64*1024*1024:
+                            raise RuntimeError("No complete DBLP publication boundary found within parser safety window.")
+                        break
+                    stop=split.end()
+                    parser.Parse(data[:stop],False)
+                    if depth!=1 or current is not None or field is not None:
+                        raise RuntimeError("DBLP segment boundary is not a complete top-level record.")
+                    parser.Parse(b"</dblp>",True)
+                    create_parser()
+                    header=(f'<?xml version="1.0" encoding="{encoding}"?>'+ ('<!DOCTYPE dblp SYSTEM "dblp.dtd">' if has_dtd else '')+'<dblp>').encode("ascii")
+                    parser.Parse(header,False)
+                    segment_bytes=len(header); segments+=1
+                    data=data[stop:]
+            parser.Parse(b"",True)
         except expat.ExpatError as exc:
-            raise RuntimeError(f"DBLP XML parse error: {exc}") from None
+            raise RuntimeError(f"DBLP XML parse error in segment {segments}: {exc}") from None
     if not count:
         raise ValueError("DBLP snapshot contains no publication records.")
     return count
@@ -250,7 +296,7 @@ def dblp_search(args):
         raise ValueError("Need distinct known Boolean query IDs.")
     tests={q["id"]:title_matcher(q["text"]) for q in queries}
     matches={qid:[] for qid in tests}; seen=set()
-    config.update(queries=queries,retrieval_kind="offline_exact_title_boolean_year_only",snapshot_name=args.snapshot.name,snapshot_sha256=file_digest(args.snapshot),dtd_sha256=file_digest(args.dtd),snapshot_citation=args.snapshot_citation)
+    config.update(queries=queries,retrieval_kind="offline_exact_title_boolean_year_only",snapshot_parser="segmented_expat_64MiB",snapshot_name=args.snapshot.name,snapshot_sha256=file_digest(args.snapshot),dtd_sha256=file_digest(args.dtd),snapshot_citation=args.snapshot_citation)
     manifest=run_create(args.out,"dblp_search",config)
     def accept(record,index):
         if index%500000==0:
