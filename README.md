@@ -2,7 +2,7 @@
 
 **Auditable literature retrieval and evidence management for software engineering systematic reviews.**
 
-Version 0.5.0 — research prototype. Python 3.10 or newer; no third-party packages. No account credentials, private manuscript, paid publisher exports, or review outcomes are included.
+Version 0.6.0 — research prototype. Python 3.10 or newer; no third-party packages. No account credentials, private manuscript, paid publisher exports, or review outcomes are included.
 
 ## Quick start (Windows PowerShell)
 
@@ -112,6 +112,16 @@ py slrkit.py crossref-search --config config/crossref-coding-agents-pilot.json -
 
 The adapter retains the exact date filters, relevance order, raw response, hashes, query text and requested rank limit. `ranked_limit` means the bounded discovery was completed, not exhaustive. The public API requires no key; optionally set `CROSSREF_MAILTO` in the environment for Crossref's polite pool. The client uses a two-second or longer gap between requests and stops on HTTP rate limiting. Missing abstracts and partial publication dates remain visible; no dates are invented. DOI identity linking works with all other sources. Provider-specific differences and study-family decisions still require review. Check the pilot's relevance before choosing and freezing the rank cutoff.
 
+### DBLP snapshot search (v0.6.0; offline)
+
+Download an official timestamped XML snapshot and its associated DTD from https://dblp.org/xml/release/ (the current DTD is also at https://dblp.org/xml/dblp.dtd). Keep the original `.xml.gz` compressed file. This example scans the entire snapshot once, using the same Boolean configuration as OpenAlex but matching exact normalized title words and phrases only. It skips semantic queries. The scan is deliberately not equivalent to a title/abstract search: DBLP has bibliographic metadata and year, not abstracts or reliable day-level publication dates.
+
+```powershell
+py slrkit.py dblp-search --config config/coding-agents-pilot.json --snapshot "C:\Downloads\dblp-2026-11-01.xml.gz" --dtd "C:\Downloads\dblp.dtd" --snapshot-citation "10.4230/dblp.xml.2026-11-01" --out runs/dblp-full-01
+```
+
+The parser streams the compressed XML without expanding it to disk or loading the entire catalogue into memory. It resolves only the explicitly supplied local DTD (no network accesses), checksums both input files, retains matched records and source query provenance, reports publications scanned, and uses exact DBLP record keys and unambiguous DOI identity for linking. Multiple DOI candidates remain flagged for adjudication. Use a fixed snapshot DOI for reproducibility and record that the snapshot may predate the review's date cutoff. No payment or API key is required. Do not claim matched title records are included studies.
+
 ## Outputs and interpretation
 
 | File | Function |
@@ -136,7 +146,7 @@ Source-exclusive candidate counts and overlaps support a later **coverage audit*
 py -m unittest discover -s tests -v
 ```
 
-Offline tests simulate OpenAlex, Scopus, Semantic Scholar, arXiv and Crossref responses and synthetic metadata. A real connection must be commissioned on the researcher's network; passing tests do not establish API availability, query adequacy, retrieval recall, AI screening accuracy, or scientific inclusion. The toolkit does not currently implement AI screening, semantic embedding locally, the Web of Science API adapter, screening consensus, automatic BibTeX export, or automatic revision linking. These are planned extensions. Use human validation and disclose any later AI use. Preserve raw licensed files privately and release only permitted metadata.
+Offline tests simulate OpenAlex, Scopus, Semantic Scholar, arXiv and Crossref responses and DBLP XML snapshots using synthetic metadata. A real connection or snapshot scan must be commissioned on the researcher's machine; passing tests do not establish API availability, query adequacy, retrieval recall, AI screening accuracy, or scientific inclusion. The toolkit does not currently implement AI screening, semantic embedding locally, the Web of Science API adapter, screening consensus, automatic BibTeX export, or automatic revision linking. These are planned extensions. Use human validation and disclose any later AI use. Preserve raw licensed files privately and release only permitted metadata.
 
 ## Reproducibility and documentation
 
@@ -147,6 +157,7 @@ Offline tests simulate OpenAlex, Scopus, Semantic Scholar, arXiv and Crossref re
 - arXiv API manual: https://info.arxiv.org/help/api/user-manual.html
 - arXiv API terms: https://info.arxiv.org/help/api/tou.html
 - Crossref REST API: https://www.crossref.org/documentation/retrieve-metadata/rest-api/
+- DBLP XML parsing: https://dblp.org/faq/How+to+parse+dblp+xml.html
 - Search and cursor paging: https://help.openalex.org/api/searching/ and https://help.openalex.org/api/paging/
 - Citation chasing: https://help.openalex.org/how-to/api-recipes/
 - PRISMA-S: https://doi.org/10.1186/s13643-020-01542-z

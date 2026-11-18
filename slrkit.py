@@ -3,6 +3,7 @@ import argparse
 import csv
 import datetime as dt
 import getpass
+import gzip
 import hashlib
 import html
 import json
@@ -16,10 +17,11 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
+from xml.parsers import expat
 from collections import Counter, defaultdict
 from pathlib import Path
 
-VERSION = "0.5.0"
+VERSION = "0.6.0"
 API = "https://api.openalex.org/works"
 SCOPUS_API = "https://api.elsevier.com/content/search/scopus"
 S2_API = "https://api.semanticscholar.org/graph/v1/paper/search/bulk"
@@ -137,6 +139,153 @@ def arxiv_query(text):
     if re.sub(r"\s+","", "".join(parts))!=re.sub(r"\s+","",text):
         raise ValueError("Unsupported arXiv translation syntax; use quoted phrases and AND/OR.")
     return " ".join(t if t in ("(",")","AND","OR") else f"(ti:{t} OR abs:{t})" for t in parts)
+
+
+def title_matcher(text):
+    tokens=re.findall(r'"[^"]+"|\(|\)|\bAND\b|\bOR\b|[A-Za-z0-9_.-]+',text)
+    if re.sub(r"\s+","","".join(tokens))!=re.sub(r"\s+","",text):
+        raise ValueError("Unsupported Boolean title query syntax.")
+    pos=0
+    def atom():
+        nonlocal pos
+        if pos>=len(tokens):
+            raise ValueError("Incomplete Boolean title query.")
+        t=tokens[pos]; pos+=1
+        if t=="(":
+            node=disjunction()
+            if pos>=len(tokens) or tokens[pos]!=")":
+                raise ValueError("Unbalanced Boolean title query.")
+            pos+=1
+            return node
+        if t in ("AND","OR","NOT",")"):
+            raise ValueError("Unexpected Boolean operator.")
+        words=normalized_title(t)
+        if not words:
+            raise ValueError("Empty Boolean title term.")
+        needle=" "+words+" "
+        return lambda title: needle in title
+    def conjunction():
+        nonlocal pos
+        nodes=[atom()]
+        while pos<len(tokens) and tokens[pos]=="AND":
+            pos+=1; nodes.append(atom())
+        return lambda title: all(n(title) for n in nodes)
+    def disjunction():
+        nonlocal pos
+        nodes=[conjunction()]
+        while pos<len(tokens) and tokens[pos]=="OR":
+            pos+=1; nodes.append(conjunction())
+        return lambda title: any(n(title) for n in nodes)
+    matcher=disjunction()
+    if pos!=len(tokens):
+        raise ValueError("Unsupported or incomplete Boolean title expression.")
+    return matcher
+
+
+def stream_dblp(path,dtd,on_record):
+    # Only the explicitly supplied local DBLP DTD may be resolved; no network.
+    dtd_bytes=dtd.read_bytes()
+    if not dtd_bytes or len(dtd_bytes)>1000000:
+        raise ValueError("Invalid DBLP DTD size.")
+    parser=expat.ParserCreate()
+    parser.SetParamEntityParsing(expat.XML_PARAM_ENTITY_PARSING_ALWAYS)
+    depth=0; current=None; field=None; chunks=[]; count=0; loaded=False
+    kinds={"article","inproceedings","proceedings","book","incollection","phdthesis","mastersthesis","data"}
+    fields={"title","year","author","editor","journal","booktitle","ee"}
+    def external(context,base,system,public):
+        nonlocal loaded
+        if loaded or context is not None or not re.fullmatch(r"dblp(?:-\d{4}-\d{2}-\d{2})?\.dtd",system or ""):
+            raise ValueError("Unexpected external XML entity; only the designated local DBLP DTD is accepted.")
+        loaded=True
+        child=parser.ExternalEntityParserCreate(context)
+        child.ExternalEntityRefHandler=lambda *args: 0
+        child.Parse(dtd_bytes,True)
+        return 1
+    def start(name,attrs):
+        nonlocal depth,current,field,chunks
+        depth+=1
+        if depth==1 and name!="dblp":
+            raise ValueError("Not a DBLP XML snapshot.")
+        if depth==2 and name in kinds:
+            current={"kind":name,"key":attrs.get("key",""),"fields":defaultdict(list)}
+        if depth==3 and current is not None and name in fields:
+            field=name; chunks=[]
+    def chars(value):
+        if field is not None:
+            chunks.append(value)
+    def end(name):
+        nonlocal depth,current,field,count
+        if depth==3 and current is not None and field==name:
+            current["fields"][field].append(" ".join("".join(chunks).split())); field=None
+        if depth==2 and current is not None:
+            count+=1; on_record(current,count); current=None
+        depth-=1
+    parser.StartElementHandler=start; parser.EndElementHandler=end; parser.CharacterDataHandler=chars
+    parser.ExternalEntityRefHandler=external
+    with gzip.open(path,"rb") if path.suffix.lower()==".gz" else path.open("rb") as source:
+        try:
+            parser.ParseFile(source)
+        except expat.ExpatError as exc:
+            raise RuntimeError(f"DBLP XML parse error: {exc}") from None
+    if not count:
+        raise ValueError("DBLP snapshot contains no publication records.")
+    return count
+
+
+def file_digest(path):
+    h=hashlib.sha256()
+    with path.open("rb") as f:
+        for block in iter(lambda:f.read(1024*1024),b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def dblp_search(args):
+    config=json.loads(args.config.read_text(encoding="utf-8-sig"))
+    start,end=config["from_date"],config["to_date"]
+    if dt.date.fromisoformat(start)>dt.date.fromisoformat(end):
+        raise ValueError("Invalid date range.")
+    queries=[q for q in config["queries"] if q.get("mode","boolean")=="boolean" and (not args.only or q["id"] in args.only)]
+    if not queries or len({q["id"] for q in queries})!=len(queries) or (args.only and set(args.only)!={q["id"] for q in queries}):
+        raise ValueError("Need distinct known Boolean query IDs.")
+    tests={q["id"]:title_matcher(q["text"]) for q in queries}
+    matches={qid:[] for qid in tests}; seen=set()
+    config.update(queries=queries,retrieval_kind="offline_exact_title_boolean_year_only",snapshot_name=args.snapshot.name,snapshot_sha256=file_digest(args.snapshot),dtd_sha256=file_digest(args.dtd),snapshot_citation=args.snapshot_citation)
+    manifest=run_create(args.out,"dblp_search",config)
+    def accept(record,index):
+        if index%500000==0:
+            print(f"DBLP: scanned {index:,} publications",flush=True)
+        f=record["fields"]; year=(f.get("year") or [""])[0]; title=(f.get("title") or [""])[0]
+        if not title or not re.fullmatch(r"\d{4}",year) or not start[:4]<=year<=end[:4]:
+            return
+        normalized=" "+normalized_title(title)+" "
+        qids=[qid for qid,matcher in tests.items() if matcher(normalized)]
+        if not qids:
+            return
+        k=record["key"]
+        if not k or k in seen:
+            raise RuntimeError("Missing or repeated DBLP record key among matching publications.")
+        seen.add(k)
+        ds=sorted({doi(x) for x in f.get("ee",[]) if doi(x)})
+        row={"title":title,"year":year,"publication_date":"","doi":ds[0] if len(ds)==1 else "","openalex_id":"","dblp_id":k,"dblp_doi_candidates":";".join(ds),"authors":"; ".join(f.get("author") or f.get("editor") or []),"venue":(f.get("journal") or f.get("booktitle") or [""])[0],"type":record["kind"],"abstract":"","url":"https://dblp.org/rec/"+k}
+        for qid in qids:
+            matches[qid].append(row)
+    try:
+        manifest["scanned_publications"]=stream_dblp(args.snapshot,args.dtd,accept)
+        if file_digest(args.snapshot)!=config["snapshot_sha256"] or file_digest(args.dtd)!=config["dtd_sha256"]:
+            raise RuntimeError("Snapshot or DTD changed during scan.")
+        for qid,rows in matches.items():
+            name=f"raw/{qid}-000001.json"; body=json_bytes({"results":rows})
+            (args.out/name).write_bytes(body)
+            manifest["pages"].append({"query_id":qid,"path":name,"sha256":digest(body),"retrieved_utc":now(),"rows":len(rows)})
+            manifest["queries"].append({"query_id":qid,"status":"exhausted","retrieved_occurrences":len(rows),"hits_first_page":len(rows),"pages":1})
+            print(f"{qid}: {len(rows)} title-matched records",flush=True)
+        manifest["status"]="complete"
+    except (Exception,KeyboardInterrupt):
+        manifest["status"]="failed_or_interrupted"
+        raise
+    finally:
+        manifest["finished_utc"]=now(); save_manifest(args.out,manifest)
 
 
 def arxiv_page(body):
@@ -783,20 +932,21 @@ def read_run(run, allow_partial):
         is_scopus = m.get("kind") == "scopus_search"
         is_s2 = m.get("kind") == "s2_search"
         is_crossref = m.get("kind") == "crossref_search"
+        is_dblp = m.get("kind") == "dblp_search"
         results = arxiv_page(body)[2] if is_arxiv else scopus_page(data)[2] if is_scopus else s2_page(data)[1] if is_s2 else crossref_page(data)[1] if is_crossref else data["results"]
         if len(results) != p["rows"]:
             raise ValueError(f"Page count mismatch: {path}")
         for i, work in enumerate(results, 1):
-            item = work if is_arxiv else normalize_scopus(work) if is_scopus else normalize_s2(work) if is_s2 else normalize_crossref(work) if is_crossref else normalize_work(work)
+            item = work if is_arxiv or is_dblp else normalize_scopus(work) if is_scopus else normalize_s2(work) if is_s2 else normalize_crossref(work) if is_crossref else normalize_work(work)
             date = item.get("publication_date") or ""
             scope = "unknown"
             if config.get("from_date") and config.get("to_date") and re.fullmatch(r"\d{4}-\d{2}-\d{2}", date):
                 scope = "in_window" if config["from_date"] <= date <= config["to_date"] else "outside_window"
                 if is_scopus:
                     scope = "cover_date_" + scope
-            if (is_s2 or is_crossref) and scope == "unknown" and re.fullmatch(r"\d{4}",item["year"]) and config.get("from_date") and config.get("to_date"):
+            if (is_s2 or is_crossref or is_dblp) and scope == "unknown" and re.fullmatch(r"\d{4}",item["year"]) and config.get("from_date") and config.get("to_date"):
                 scope = "year_in_window_date_unknown" if config["from_date"][:4] <= item["year"] <= config["to_date"][:4] else "year_outside_window"
-            yield item, {"source": "arXiv" if is_arxiv else "Scopus" if is_scopus else "Semantic Scholar" if is_s2 else "Crossref" if is_crossref else "OpenAlex", "query_id": p["query_id"], "raw_path": str(path), "row": i, "sha256": p["sha256"], "date_scope": scope}
+            yield item, {"source": "DBLP" if is_dblp else "arXiv" if is_arxiv else "Scopus" if is_scopus else "Semantic Scholar" if is_s2 else "Crossref" if is_crossref else "OpenAlex", "query_id": p["query_id"], "raw_path": str(path), "row": i, "sha256": p["sha256"], "date_scope": scope}
 
 
 def read_csv(source, path):
@@ -819,7 +969,7 @@ def consolidate(occurrences):
     # DOI or OpenAlex identity is retained for adjudication rather than hidden.
     if any("arxiv_id" in i for i,_ in occurrences):
         occurrences=[({**i,"arxiv_id":i.get("arxiv_id") or arxiv_id(i["doi"]) or (arxiv_id(i["url"]) if not i["doi"] and re.match(r"https?://(?:www\.)?arxiv\.org/(?:abs|pdf)/",i["url"]) else "")},p) for i,p in occurrences]
-    identity_fields=("doi","openalex_id","scopus_id","s2_id","arxiv_id")
+    identity_fields=("doi","openalex_id","scopus_id","s2_id","arxiv_id","dblp_id")
     parent = list(range(len(occurrences)))
     def find(i):
         while parent[i] != i:
@@ -853,23 +1003,27 @@ def consolidate(occurrences):
         sids = sorted({i["scopus_id"] for i, _ in group if i.get("scopus_id")})
         s2ids = sorted({i["s2_id"] for i, _ in group if i.get("s2_id")})
         aids=sorted({i["arxiv_id"] for i,_ in group if i.get("arxiv_id")})
-        signature = ids + wids + sids + s2ids + ["arxiv:"+a for a in aids] or sorted({p["source"] + ":" + p["sha256"] + ":" + str(p["row"]) for _, p in group})
+        dids=sorted({i["dblp_id"] for i,_ in group if i.get("dblp_id")})
+        signature = ids + wids + sids + s2ids + ["arxiv:"+a for a in aids] + ["dblp:"+d for d in dids] or sorted({p["source"] + ":" + p["sha256"] + ":" + str(p["row"]) for _, p in group})
         rid = "R-" + digest(";".join(signature).encode())[:20]
         row = {k: max((i[k] for i, _ in group), key=lambda v: (len(v), v)) for k in COLS if k in group[0][0]}
         if any("scopus_id" in i for i, _ in group):
             row["scopus_id"] = ";".join(sids)
         if any("s2_id" in i for i, _ in group):
             row["s2_id"] = ";".join(s2ids)
+        if dids:
+            row["dblp_id"]=";".join(dids)
+            row["dblp_doi_candidates"]=";".join(sorted({d for i,_ in group for d in i.get("dblp_doi_candidates","").split(";") if d}))
         if any("arxiv_id" in i for i,_ in group):
             row["arxiv_id"]=";".join(aids)
             for field in ("arxiv_related_doi","arxiv_version_url"):
                 row[field]=";".join(sorted({i[field] for i,_ in group if i.get(field)}))
         row.update(record_id=rid, sources=";".join(sorted({p["source"] for _, p in group})), query_ids=";".join(sorted({p["query_id"] for _, p in group})), occurrences=len(group))
         records.append(row)
-        if len(ids) > 1 or len(wids) > 1 or len(sids) > 1 or len(s2ids)>1 or len(aids)>1:
-            conflicts.append({"record_id": rid, "dois": ";".join(ids), "openalex_ids": ";".join(wids), "scopus_ids": ";".join(sids), "s2_ids":";".join(s2ids), "arxiv_ids":";".join(aids), "status": "needs_adjudication"})
+        if len(ids) > 1 or len(wids) > 1 or len(sids) > 1 or len(s2ids)>1 or len(aids)>1 or len(dids)>1 or any(len(i.get("dblp_doi_candidates","").split(";"))>1 for i,_ in group):
+            conflicts.append({"record_id": rid, "dois": ";".join(ids), "openalex_ids": ";".join(wids), "scopus_ids": ";".join(sids), "s2_ids":";".join(s2ids), "arxiv_ids":";".join(aids), "dblp_ids":";".join(dids), "dblp_doi_candidates":row.get("dblp_doi_candidates",""), "status": "needs_adjudication"})
         for item, p in group:
-            provenance.append({"record_id": rid, **p, "observed_doi": item["doi"], "observed_openalex_id": item["openalex_id"], "observed_scopus_id": item.get("scopus_id",""), "observed_s2_id":item.get("s2_id",""), "observed_arxiv_id":item.get("arxiv_id",""), "observed_arxiv_related_doi":item.get("arxiv_related_doi",""), "observed_arxiv_version_url":item.get("arxiv_version_url",""), "observed_title": item["title"]})
+            provenance.append({"record_id": rid, **p, "observed_doi": item["doi"], "observed_openalex_id": item["openalex_id"], "observed_scopus_id": item.get("scopus_id",""), "observed_s2_id":item.get("s2_id",""), "observed_arxiv_id":item.get("arxiv_id",""), "observed_arxiv_related_doi":item.get("arxiv_related_doi",""), "observed_arxiv_version_url":item.get("arxiv_version_url",""), "observed_dblp_id":item.get("dblp_id",""), "observed_dblp_doi_candidates":item.get("dblp_doi_candidates",""), "observed_title": item["title"]})
     titles = defaultdict(list)
     for r in records:
         title = normalized_title(r["title"])
@@ -901,10 +1055,11 @@ def merge(args):
     has_s2 = any("s2_id" in i for i, _ in occurrences)
     has_arxiv = any("arxiv_id" in i for i, _ in occurrences)
     arxiv_cols=["arxiv_id","arxiv_related_doi","arxiv_version_url"] if has_arxiv else []
-    cols = COLS + (["scopus_id"] if has_scopus else []) + (["s2_id"] if has_s2 else []) + arxiv_cols
+    dblp_cols=["dblp_id","dblp_doi_candidates"] if any("dblp_id" in i for i,_ in occurrences) else []
+    cols = COLS + (["scopus_id"] if has_scopus else []) + (["s2_id"] if has_s2 else []) + arxiv_cols + dblp_cols
     csv_write(args.out / "records.csv", records, cols)
-    csv_write(args.out / "provenance.csv", provenance, ["record_id", "source", "query_id", "raw_path", "row", "sha256", "date_scope", "observed_doi", "observed_openalex_id", "observed_title"] + (["observed_scopus_id"] if has_scopus else []) + (["observed_s2_id"] if has_s2 else []) + ["observed_"+c for c in arxiv_cols])
-    csv_write(args.out / "identifier_conflicts.csv", conflicts, ["record_id", "dois", "openalex_ids", "status"] + (["scopus_ids"] if has_scopus else []) + (["s2_ids"] if has_s2 else []) + (["arxiv_ids"] if has_arxiv else []))
+    csv_write(args.out / "provenance.csv", provenance, ["record_id", "source", "query_id", "raw_path", "row", "sha256", "date_scope", "observed_doi", "observed_openalex_id", "observed_title"] + (["observed_scopus_id"] if has_scopus else []) + (["observed_s2_id"] if has_s2 else []) + ["observed_"+c for c in arxiv_cols+dblp_cols])
+    csv_write(args.out / "identifier_conflicts.csv", conflicts, ["record_id", "dois", "openalex_ids", "status"] + (["scopus_ids"] if has_scopus else []) + (["s2_ids"] if has_s2 else []) + (["arxiv_ids"] if has_arxiv else []) + (["dblp_ids","dblp_doi_candidates"] if dblp_cols else []))
     csv_write(args.out / "version_candidates.csv", pairs, ["record_a", "record_b", "title", "year_a", "year_b", "status"])
     review_fields = ["reviewer_id", "decision", "exclusion_reason", "notes"]
     for stage in ("title_abstract", "full_text"):
@@ -975,6 +1130,14 @@ def main(argv=None):
     sp.add_argument("--top", type=int, default=200, help="Bounded ranked results per query (1..1000).")
     sp.add_argument("--delay", type=float, default=2.0)
     sp.set_defaults(fn=crossref_search)
+    sp = sub.add_parser("dblp-search")
+    sp.add_argument("--config", type=Path, required=True)
+    sp.add_argument("--snapshot", type=Path, required=True)
+    sp.add_argument("--dtd", type=Path, required=True)
+    sp.add_argument("--snapshot-citation", required=True)
+    sp.add_argument("--out", type=Path, required=True)
+    sp.add_argument("--only", action="append")
+    sp.set_defaults(fn=dblp_search)
     args = p.parse_args(argv)
     if getattr(args, "max_pages", None) is not None and args.max_pages < 1:
         p.error("--max-pages must be positive")

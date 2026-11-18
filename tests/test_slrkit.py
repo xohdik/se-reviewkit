@@ -413,5 +413,51 @@ class CrossrefTests(unittest.TestCase):
             self.assertEqual(fetch.call_count,1)
 
 
+class DblpTests(unittest.TestCase):
+    def test_matcher(self):
+        m=kit.title_matcher('("coding agent" OR "SWE-bench") AND (verification OR testing)')
+        self.assertTrue(m(" coding agent testing "))
+        self.assertTrue(m(" swe bench verification "))
+        self.assertFalse(m(" coding agent generation "))
+        self.assertFalse(m(" agent verification "))
+        with self.assertRaises(ValueError):
+            kit.title_matcher("agent AND (verification")
+
+    def test_stream_and_merge(self):
+        import gzip
+        with tempfile.TemporaryDirectory() as d:
+            base=Path(d); snapshot=base/"dblp.xml.gz"; dtd=base/"dblp.dtd"; cfg=base/"config.json"
+            dtd.write_text('<!ENTITY eacute "&#233;">')
+            xml=b'<?xml version="1.0"?><!DOCTYPE dblp SYSTEM "dblp.dtd"><dblp><article key="journals/x/A"><author>Ren&eacute;</author><title>Coding agent <i>verification</i></title><year>2025</year><ee>https://doi.org/10.1234/a</ee></article><inproceedings key="conf/x/B"><title>Coding agent verification</title><year>2026</year></inproceedings><article key="journals/x/Old"><title>Coding agent verification</title><year>2020</year></article><www key="home/x"><title>Coding agent verification</title><year>2025</year></www></dblp>'
+            with gzip.open(snapshot,"wb") as f:
+                f.write(xml)
+            cfg.write_text(json.dumps({"from_date":"2022-01-01","to_date":"2026-11-18","queries":[{"id":"Q1","text":"agent AND verification"},{"id":"Q2","text":"\"coding agent\""},{"id":"Q3","mode":"semantic","text":"ignored"}]}))
+            run=base/"dblp"
+            kit.dblp_search(SimpleNamespace(config=cfg,snapshot=snapshot,dtd=dtd,snapshot_citation="example snapshot",out=run,only=None))
+            m=json.loads((run/"manifest.json").read_text())
+            self.assertEqual(m["scanned_publications"],3)
+            rows=list(kit.read_run(run,False))
+            self.assertEqual(len(rows),4)
+            self.assertEqual(rows[0][0]["authors"],"René")
+            self.assertEqual(rows[0][1]["source"],"DBLP")
+            self.assertEqual(rows[0][1]["date_scope"],"year_in_window_date_unknown")
+            oa=base/"oa"
+            kit.execute_run(oa,"search",{},[("Q",{})],MockClient([page([work("W1","Coding agent verification","10.1234/a")])]),None)
+            args=SimpleNamespace(run=[oa,run],csv=[],allow_partial=False,out=base/"merged")
+            kit.merge(args)
+            report=json.loads((args.out/"report.json").read_text())
+            self.assertEqual(report["retrieval_occurrences"],5)
+            self.assertEqual(report["identifier_clusters"],2)
+            self.assertEqual(report["source_overlap"]["OpenAlex"]["DBLP"],1)
+
+    def test_external_entity_rejection(self):
+        with tempfile.TemporaryDirectory() as d:
+            base=Path(d); snapshot=base/"dblp.xml"; dtd=base/"dblp.dtd"
+            dtd.write_text('<!ENTITY eacute "&#233;">')
+            snapshot.write_text('<!DOCTYPE dblp SYSTEM "https://example.invalid/evil.dtd"><dblp/>')
+            with self.assertRaisesRegex(ValueError,"Unexpected external"):
+                kit.stream_dblp(snapshot,dtd,lambda *args: None)
+
+
 if __name__ == "__main__":
     unittest.main()
