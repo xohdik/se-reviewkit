@@ -1,0 +1,12 @@
+{
+  "status": "pilot; calibrate and freeze before formal retrieval",
+  "from_date": "2022-01-01",
+  "to_date": "2026-11-18",
+  "queries": [
+    {"id": "Q01_agent_verification", "mode": "boolean", "text": "(\"coding agent\" OR \"software engineering agent\" OR \"agentic software engineering\" OR \"autonomous coding\" OR \"SWE-bench\") AND (verification OR validation OR correctness OR assurance OR oracle OR testing OR review)"},
+    {"id": "Q02_evaluation_integrity", "mode": "boolean", "text": "(\"coding agent\" OR \"software engineering agent\" OR \"SWE-bench\" OR \"automated issue resolution\") AND (\"test overfitting\" OR \"reward hacking\" OR leakage OR contamination OR \"test manipulation\" OR \"benchmark validity\")"},
+    {"id": "Q03_repository_checks", "mode": "boolean", "text": "(\"repository-level\" OR \"issue resolution\" OR \"patch generation\" OR \"program repair\") AND (agent OR LLM) AND (\"patch verification\" OR \"test generation\" OR \"regression test\" OR \"patch correctness\" OR \"formal verification\")"},
+    {"id": "Q04_verifier_mechanisms", "mode": "boolean", "text": "(\"coding agent\" OR \"software engineering agent\" OR \"SWE-bench\") AND (verifier OR critic OR reviewer OR rubric OR \"process reward\" OR \"test oracle\" OR \"formal proof\")"},
+    {"id": "Q05_semantic_discovery", "mode": "semantic", "text": "Research that evaluates whether autonomous software engineering agents produce correct and secure changes, including independent verification, inadequate or manipulated test oracles, patch correctness, benchmark contamination, and verification evidence integrity."}
+  ]
+}

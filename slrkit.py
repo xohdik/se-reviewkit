@@ -1,0 +1,420 @@
+"""SE-ReviewKit: auditable retrieval and screening handoff (Python 3.10+)."""
+import argparse
+import csv
+import datetime as dt
+import getpass
+import hashlib
+import json
+import math
+import os
+import re
+import sys
+import time
+import unicodedata
+import urllib.error
+import urllib.parse
+import urllib.request
+from collections import Counter, defaultdict
+from pathlib import Path
+
+VERSION = "0.1.1"
+API = "https://api.openalex.org/works"
+FIELDS = "id,doi,title,publication_year,publication_date,authorships,primary_location,type,abstract_inverted_index,referenced_works,open_access"
+COLS = ["record_id", "title", "year", "publication_date", "doi", "openalex_id", "authors", "venue", "type", "abstract", "url", "sources", "query_ids", "occurrences"]
+
+
+def now():
+    return dt.datetime.now(dt.timezone.utc).isoformat()
+
+
+def digest(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def json_bytes(data):
+    return (json.dumps(data, ensure_ascii=False, sort_keys=True, indent=2) + "\n").encode("utf-8")
+
+
+def write_json(path, obj):
+    path.write_bytes(json_bytes(obj))
+
+
+def doi(value):
+    value = str(value or "").strip().lower()
+    value = re.sub(r"^(https?://(dx\.)?doi\.org/|doi:\s*)", "", value)
+    return value if re.fullmatch(r"10\.\d{4,9}/\S+", value) else ""
+
+
+def work_id(value):
+    value = str(value or "").strip().rsplit("/", 1)[-1].upper()
+    return value if re.fullmatch(r"W\d+", value) else ""
+
+
+def normalized_title(value):
+    value = unicodedata.normalize("NFKC", str(value or "")).casefold()
+    return " ".join(re.findall(r"[^\W_]+", value, flags=re.UNICODE))
+
+
+def abstract(index):
+    if not isinstance(index, dict):
+        return ""
+    words = {}
+    for word, positions in index.items():
+        for pos in positions:
+            if isinstance(pos, int) and 0 <= pos < 100000:
+                words[pos] = word
+    return " ".join(words[p] for p in sorted(words))
+
+
+def normalize_work(work):
+    loc = work.get("primary_location") or {}
+    source = loc.get("source") or {}
+    return {
+        "title": work.get("title") or work.get("display_name") or "",
+        "year": str(work.get("publication_year") or ""),
+        "publication_date": work.get("publication_date") or "",
+        "doi": doi(work.get("doi")), "openalex_id": work_id(work.get("id")),
+        "authors": "; ".join((a.get("author") or {}).get("display_name") or "" for a in (work.get("authorships") or [])),
+        "venue": source.get("display_name") or "", "type": work.get("type") or "",
+        "abstract": abstract(work.get("abstract_inverted_index")),
+        "url": loc.get("landing_page_url") or work.get("id") or "",
+    }
+
+
+def csv_write(path, rows, fields):
+    with path.open("w", encoding="utf-8-sig", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+class OpenAlex:
+    def __init__(self, key, delay=1.1, retries=4, timeout=40):
+        self.key, self.delay, self.retries, self.timeout = key, delay, retries, timeout
+
+    def fetch(self, params, path=""):
+        # Key stays in HTTP Authorization, never in URL, files, or diagnostics.
+        url = API + path + ("?" + urllib.parse.urlencode(params) if params else "")
+        for n in range(self.retries + 1):
+            req = urllib.request.Request(url, headers={"Authorization": "Bearer " + self.key, "User-Agent": "SE-ReviewKit/" + VERSION, "Accept": "application/json"})
+            try:
+                with urllib.request.urlopen(req, timeout=self.timeout) as response:
+                    body = response.read()
+                time.sleep(self.delay)
+                return json.loads(body), body
+            except urllib.error.HTTPError as exc:
+                status = exc.code
+                if status not in (429, 500, 502, 503, 504) or n == self.retries:
+                    detail = ""
+                    try:
+                        error = json.loads(exc.read(4096))
+                        detail = " ".join(str(error.get(k, "")) for k in ("error", "message")).strip()
+                        detail = detail.replace(self.key, "[REDACTED]").replace("\r", " ").replace("\n", " ")[:500]
+                    except (ValueError, OSError, AttributeError):
+                        pass
+                    raise RuntimeError(f"OpenAlex HTTP {status}: {detail or 'examine key, quota, and query syntax.'}") from None
+                retry = exc.headers.get("Retry-After", "")
+                time.sleep(max(self.delay, min(60, int(retry)) if retry.isdigit() else min(60, 2 ** n)))
+            except (urllib.error.URLError, TimeoutError, OSError):
+                if n == self.retries:
+                    raise RuntimeError("OpenAlex connection failed; check network access.") from None
+                time.sleep(min(60, 2 ** n))
+        raise AssertionError("unreachable")
+
+
+def key():
+    value = os.environ.get("OPENALEX_API_KEY") or getpass.getpass("OpenAlex API key (hidden): ")
+    if not value.strip():
+        raise ValueError("An API key is required for cursor paging.")
+    return value.strip()
+
+
+def run_create(out, kind, config):
+    out.mkdir(parents=True, exist_ok=False)
+    (out / "raw").mkdir()
+    write_json(out / "config.json", config)
+    manifest = {"tool_version": VERSION, "kind": kind, "started_utc": now(), "status": "running", "config_sha256": digest((out / "config.json").read_bytes()), "queries": [], "pages": []}
+    write_json(out / "manifest.json", manifest)
+    return manifest
+
+
+def save_manifest(out, manifest):
+    write_json(out / "manifest.json", manifest)
+
+
+def retrieve(client, out, manifest, query_id, params, max_pages=None):
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", query_id):
+        raise ValueError("Query identifier must be alphanumeric, underscore or hyphen.")
+    entry = {"query_id": query_id, "params": params, "started_utc": now(), "hits_first_page": None, "retrieved_occurrences": 0, "pages": 0, "status": "running"}
+    manifest["queries"].append(entry)
+    save_manifest(out, manifest)
+    if "search.semantic" in params:
+        # Semantic retrieval is a bounded ranked list, not cursor-paginated.
+        # OpenAlex supports year filters here, but not exact date filters.
+        request = {**params, "per_page": 50, "select": FIELDS}
+        data, body = client.fetch(request)
+        results = data.get("results")
+        if not isinstance(results, list) or len(results) > 50:
+            raise RuntimeError("Unexpected OpenAlex semantic response.")
+        meta = data.get("meta") or {}
+        filename = f"raw/{query_id}-000001.json"
+        (out / filename).write_bytes(body)
+        entry.update(hits_first_page=meta.get("count"), executed_query=(meta.get("x_query") or {}).get("oql"), retrieved_occurrences=len(results), pages=1, status="ranked_limit", finished_utc=now(), request_params=request)
+        manifest["pages"].append({"query_id": query_id, "path": filename, "sha256": digest(body), "retrieved_utc": now(), "rows": len(results)})
+        save_manifest(out, manifest)
+        print(f"{query_id}: bounded semantic retrieval, {len(results)} records", flush=True)
+        return
+    cursor, seen = "*", set()
+    while cursor:
+        if cursor in seen:
+            raise RuntimeError("Repeated cursor; retrieval not complete.")
+        seen.add(cursor)
+        data, body = client.fetch({**params, "cursor": cursor, "per_page": 100, "select": FIELDS})
+        meta = data.get("meta") or {}
+        results = data.get("results")
+        if not isinstance(results, list) or "next_cursor" not in meta:
+            raise RuntimeError("Unexpected OpenAlex page response.")
+        if entry["pages"] == 0:
+            entry["hits_first_page"] = meta.get("count")
+            entry["executed_query"] = (meta.get("x_query") or {}).get("oql")
+        entry["pages"] += 1
+        entry["retrieved_occurrences"] += len(results)
+        filename = f"raw/{query_id}-{entry['pages']:06d}.json"
+        (out / filename).write_bytes(body)
+        manifest["pages"].append({"query_id": query_id, "path": filename, "sha256": digest(body), "retrieved_utc": now(), "rows": len(results)})
+        cursor = meta.get("next_cursor")
+        save_manifest(out, manifest)
+        print(f"{query_id}: page {entry['pages']}, {entry['retrieved_occurrences']} records", flush=True)
+        if max_pages and entry["pages"] >= max_pages and cursor:
+            entry["status"] = "capped"
+            break
+    else:
+        entry["status"] = "exhausted"
+    entry["finished_utc"] = now()
+    save_manifest(out, manifest)
+
+
+def execute_run(out, kind, config, tasks, client, cap):
+    manifest = run_create(out, kind, config)
+    try:
+        for qid, params in tasks:
+            retrieve(client, out, manifest, qid, params, cap)
+        manifest["status"] = "complete" if all(q["status"] in ("exhausted", "ranked_limit") for q in manifest["queries"]) else "partial_capped"
+    except (Exception, KeyboardInterrupt):
+        manifest["status"] = "failed_or_interrupted"
+        raise
+    finally:
+        manifest["finished_utc"] = now()
+        save_manifest(out, manifest)
+
+
+def search(args):
+    config = json.loads(args.config.read_text(encoding="utf-8"))
+    start, end = config["from_date"], config["to_date"]
+    if dt.date.fromisoformat(start) > dt.date.fromisoformat(end):
+        raise ValueError("Invalid date range.")
+    tasks = []
+    for q in config["queries"]:
+        if args.only and q["id"] not in args.only:
+            continue
+        mode = q.get("mode", "boolean")
+        if mode not in ("boolean", "semantic"):
+            raise ValueError("Unsupported query mode.")
+        if mode == "boolean":
+            params = {"search.title_and_abstract": q["text"], "filter": f"from_publication_date:{start},to_publication_date:{end}"}
+        else:
+            params = {"search.semantic": q["text"], "filter": f"publication_year:{start[:4]}-{end[:4]}"}
+        tasks.append((q["id"], params))
+    if args.only and set(args.only) != {q[0] for q in tasks}:
+        raise ValueError("Unknown --only query identifier.")
+    if not tasks or len({q[0] for q in tasks}) != len(tasks):
+        raise ValueError("Need distinct query IDs.")
+    config["queries"] = [q for q in config["queries"] if q["id"] in {task[0] for task in tasks}]
+    execute_run(args.out, "search", config, tasks, OpenAlex(key(), delay=args.delay), args.max_pages)
+
+
+def chase(args):
+    ids = [work_id(line) for line in args.seeds.read_text(encoding="utf-8").splitlines() if line.strip()]
+    if not ids or not all(ids):
+        raise ValueError("Seed file must contain one valid OpenAlex W identifier per line.")
+    if dt.date.fromisoformat(args.from_date) > dt.date.fromisoformat(args.to_date):
+        raise ValueError("Invalid date range.")
+    client = OpenAlex(key(), delay=args.delay)
+    tasks = []
+    config = {"seeds": sorted(set(ids)), "from_date": args.from_date, "to_date": args.to_date, "direction": args.direction}
+    dates = f"from_publication_date:{args.from_date},to_publication_date:{args.to_date}"
+    for wid in config["seeds"]:
+        if args.direction in ("forward", "both"):
+            tasks.append((f"forward-{wid}", {"filter": f"cites:{wid},{dates}"}))
+        if args.direction in ("backward", "both"):
+            seed, _ = client.fetch({"select": "id,referenced_works"}, "/" + wid)
+            refs = sorted({work_id(v) for v in seed.get("referenced_works", [])} - {""})
+            config.setdefault("backward_seed_reference_ids", {})[wid] = refs
+            for offset in range(0, len(refs), 50):
+                tasks.append((f"backward-{wid}-{offset//50+1}", {"filter": "openalex:" + "|".join(refs[offset:offset+50]) + "," + dates}))
+    if not tasks:
+        raise ValueError("No indexed citation neighbors for the selected seed(s).")
+    execute_run(args.out, "citation_chasing", config, tasks, client, args.max_pages)
+
+
+def read_run(run, allow_partial):
+    m = json.loads((run / "manifest.json").read_text(encoding="utf-8"))
+    if m["status"] != "complete" and not allow_partial:
+        raise ValueError(f"Incomplete run: {run}; pass --allow-partial only for pilot exploration.")
+    if digest((run / "config.json").read_bytes()) != m["config_sha256"]:
+        raise ValueError(f"Config checksum mismatch: {run}")
+    config = json.loads((run / "config.json").read_text(encoding="utf-8"))
+    for p in m["pages"]:
+        path = run / p["path"]
+        if not path.resolve().is_relative_to(run.resolve()):
+            raise ValueError("Invalid page path.")
+        body = path.read_bytes()
+        if digest(body) != p["sha256"]:
+            raise ValueError(f"Page checksum mismatch: {path}")
+        data = json.loads(body)
+        if len(data["results"]) != p["rows"]:
+            raise ValueError(f"Page count mismatch: {path}")
+        for i, work in enumerate(data["results"], 1):
+            date = work.get("publication_date") or ""
+            scope = "unknown"
+            if config.get("from_date") and config.get("to_date") and re.fullmatch(r"\d{4}-\d{2}-\d{2}", date):
+                scope = "in_window" if config["from_date"] <= date <= config["to_date"] else "outside_window"
+            yield normalize_work(work), {"source": "OpenAlex", "query_id": p["query_id"], "raw_path": str(path), "row": i, "sha256": p["sha256"], "date_scope": scope}
+
+
+def read_csv(source, path):
+    file_hash = digest(path.read_bytes())
+    with path.open(encoding="utf-8-sig", newline="") as handle:
+        for i, row in enumerate(csv.DictReader(handle), 2):
+            fields = {k.strip().casefold(): str(v or "") for k, v in row.items() if k is not None}
+            def get(*names):
+                return next((fields[n] for n in names if fields.get(n)), "")
+            item = {"title": get("title", "article title", "document title"), "year": get("year", "publication year", "pubyear"), "publication_date": get("publication date", "publication_date"), "doi": doi(get("doi", "digital object identifier")), "openalex_id": work_id(get("openalex_id")), "authors": get("authors", "author", "author full names"), "venue": get("source title", "venue", "publication title", "journal"), "type": get("document type", "type"), "abstract": get("abstract"), "url": get("url", "link", "document url")}
+            if not item["title"]:
+                raise ValueError(f"Missing title at {path}:row {i}")
+            yield item, {"source": source, "query_id": "institutional_export", "raw_path": str(path), "row": i, "sha256": file_hash, "date_scope": "not_evaluated"}
+
+
+def consolidate(occurrences):
+    # Union exact shared identifiers, never title-only candidates. Conflicting
+    # DOI or OpenAlex identity is retained for adjudication rather than hidden.
+    parent = list(range(len(occurrences)))
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+    seen = {}
+    for i, (item, provenance) in enumerate(occurrences):
+        for name in ("doi", "openalex_id"):
+            if item[name]:
+                k = (name, item[name])
+                if k in seen:
+                    a, b = find(i), find(seen[k])
+                    parent[max(a, b)] = min(a, b)
+                else:
+                    seen[k] = i
+        if not item["doi"] and not item["openalex_id"]:
+            k = ("exact_occurrence", provenance["source"], provenance["sha256"], provenance["row"])
+            if k in seen:
+                a, b = find(i), find(seen[k])
+                parent[max(a, b)] = min(a, b)
+            else:
+                seen[k] = i
+    groups = defaultdict(list)
+    for i, pair in enumerate(occurrences):
+        groups[find(i)].append(pair)
+    records, provenance, conflicts = [], [], []
+    for group in groups.values():
+        ids = sorted({i["doi"] for i, _ in group if i["doi"]})
+        wids = sorted({i["openalex_id"] for i, _ in group if i["openalex_id"]})
+        signature = ids + wids or sorted({p["source"] + ":" + p["sha256"] + ":" + str(p["row"]) for _, p in group})
+        rid = "R-" + digest(";".join(signature).encode())[:20]
+        row = {k: max((i[k] for i, _ in group), key=lambda v: (len(v), v)) for k in COLS if k in group[0][0]}
+        row.update(record_id=rid, sources=";".join(sorted({p["source"] for _, p in group})), query_ids=";".join(sorted({p["query_id"] for _, p in group})), occurrences=len(group))
+        records.append(row)
+        if len(ids) > 1 or len(wids) > 1:
+            conflicts.append({"record_id": rid, "dois": ";".join(ids), "openalex_ids": ";".join(wids), "status": "needs_adjudication"})
+        for item, p in group:
+            provenance.append({"record_id": rid, **p, "observed_doi": item["doi"], "observed_openalex_id": item["openalex_id"], "observed_title": item["title"]})
+    titles = defaultdict(list)
+    for r in records:
+        title = normalized_title(r["title"])
+        if title:
+            titles[title].append(r)
+    pairs = []
+    for title, members in titles.items():
+        if len(members) > 1:
+            for a in range(len(members)):
+                for b in range(a + 1, len(members)):
+                    pairs.append({"record_a": members[a]["record_id"], "record_b": members[b]["record_id"], "title": title, "year_a": members[a]["year"], "year_b": members[b]["year"], "status": "needs_adjudication"})
+    return sorted(records, key=lambda r: r["record_id"]), provenance, conflicts, pairs
+
+
+def merge(args):
+    occurrences = []
+    for path in args.run:
+        occurrences.extend(read_run(path, args.allow_partial))
+    for spec in args.csv:
+        source, path = spec.split("=", 1)
+        if not source.strip():
+            raise ValueError("Empty CSV source name.")
+        occurrences.extend(read_csv(source, Path(path)))
+    if not occurrences:
+        raise ValueError("No records to consolidate.")
+    records, provenance, conflicts, pairs = consolidate(occurrences)
+    args.out.mkdir(parents=True, exist_ok=False)
+    csv_write(args.out / "records.csv", records, COLS)
+    csv_write(args.out / "provenance.csv", provenance, ["record_id", "source", "query_id", "raw_path", "row", "sha256", "date_scope", "observed_doi", "observed_openalex_id", "observed_title"])
+    csv_write(args.out / "identifier_conflicts.csv", conflicts, ["record_id", "dois", "openalex_ids", "status"])
+    csv_write(args.out / "version_candidates.csv", pairs, ["record_a", "record_b", "title", "year_a", "year_b", "status"])
+    review_fields = ["reviewer_id", "decision", "exclusion_reason", "notes"]
+    for stage in ("title_abstract", "full_text"):
+        csv_write(args.out / (stage + "_screening.csv"), records, COLS + review_fields)
+    evidence = ["claim_id", "record_id", "study_family_id", "rq", "artifact", "property", "mechanism", "oracle", "independence", "outcome", "value", "unit", "numerator", "denominator", "comparator", "source_locator", "source_url", "interpretation_limit", "reviewer_id", "validation_status"]
+    csv_write(args.out / "evidence_claims.csv", [], evidence)
+    source_sets = {r["record_id"]: set(r["sources"].split(";")) for r in records}
+    sources = sorted({s for ss in source_sets.values() for s in ss})
+    report = {"tool_version": VERSION, "created_utc": now(), "retrieval_occurrences": len(occurrences), "identifier_clusters": len(records), "identifier_conflicts": len(conflicts), "title_only_version_candidates": len(pairs), "missing_abstract": sum(not r["abstract"] for r in records), "records_by_source": {s: sum(s in v for v in source_sets.values()) for s in sources}, "exclusive_records_by_source": {s: sum(v == {s} for v in source_sets.values()) for s in sources}, "source_overlap": {s: {t: sum(s in v and t in v for v in source_sets.values()) for t in sources} for s in sources}, "allow_partial": args.allow_partial, "inclusion_count": None, "note": "Retrieval occurrences are not unique studies. Study-family decisions and reviewer screening remain pending."}
+    report["date_scope_occurrences"] = dict(Counter(p.get("date_scope", "unknown") for p in provenance))
+    write_json(args.out / "report.json", report)
+    print(json.dumps(report, indent=2))
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--version", action="version", version=VERSION)
+    sub = p.add_subparsers(dest="command", required=True)
+    for name, fn in (("search", search), ("chase", chase)):
+        sp = sub.add_parser(name)
+        sp.add_argument("--out", type=Path, required=True)
+        sp.add_argument("--max-pages", type=int, help="Pilot cap per query; omit for full retrieval.")
+        sp.add_argument("--delay", type=float, default=1.1, help="Seconds between requests (>=1).")
+        if name == "search":
+            sp.add_argument("--config", type=Path, required=True)
+            sp.add_argument("--only", action="append", help="Run only the named query ID; may be repeated.")
+        else:
+            sp.add_argument("--seeds", type=Path, required=True)
+            sp.add_argument("--from-date", required=True)
+            sp.add_argument("--to-date", required=True)
+            sp.add_argument("--direction", choices=["forward", "backward", "both"], default="both")
+        sp.set_defaults(fn=fn)
+    sp = sub.add_parser("merge")
+    sp.add_argument("--run", type=Path, action="append", default=[])
+    sp.add_argument("--csv", action="append", default=[], help="Source=path, one per export")
+    sp.add_argument("--allow-partial", action="store_true")
+    sp.add_argument("--out", type=Path, required=True)
+    sp.set_defaults(fn=merge)
+    args = p.parse_args(argv)
+    if getattr(args, "max_pages", None) is not None and args.max_pages < 1:
+        p.error("--max-pages must be positive")
+    if not math.isfinite(getattr(args, "delay", 1.1)) or getattr(args, "delay", 1.1) < 1:
+        p.error("--delay must be at least 1 second")
+    try:
+        args.fn(args)
+    except (ValueError, RuntimeError, OSError, KeyError) as exc:
+        p.exit(1, f"SE-ReviewKit: {exc}\n")
+
+
+if __name__ == "__main__":
+    main()
