@@ -1,0 +1,14 @@
+{
+  "status": "example DBLP-specific complementary title-only expansion; calibrate before final review",
+  "from_date": "2022-01-01",
+  "to_date": "2026-11-18",
+  "queries": [
+    {"id": "D01_agent_titles", "mode": "boolean", "text": "(\"coding agent\" OR \"coding agents\" OR \"code agent\" OR \"code agents\" OR \"software engineering agent\" OR \"software engineering agents\" OR \"programming agent\" OR \"programming agents\" OR \"agentic coding\" OR \"agentic software engineering\" OR \"autonomous coding\" OR \"autonomous software engineering\" OR \"agentic software development\")"},
+    {"id": "D02_benchmark_titles", "mode": "boolean", "text": "(\"SWE-bench\" OR SWEbench OR \"SWE-agent\" OR SWEagent OR \"software engineering benchmark\" OR \"software engineering benchmarks\" OR \"coding benchmark\" OR \"coding benchmarks\")"},
+    {"id": "D03_repository_tasks", "mode": "boolean", "text": "(\"issue resolution\" OR \"issue resolving\" OR \"repository-level\" OR \"pull request\" OR \"pull requests\" OR \"patch generation\") AND (agent OR agents OR agentic OR LLM OR LLMs OR \"language model\" OR \"language models\")"},
+    {"id": "D04_patch_correctness", "mode": "boolean", "text": "(\"patch correctness\" OR \"patch verification\" OR \"patch validation\" OR \"patch assessment\" OR \"patch verifier\" OR \"patch verifiers\" OR \"program repair\") AND (agent OR agents OR agentic OR LLM OR LLMs OR \"language model\" OR \"language models\")"},
+    {"id": "D05_oracle_integrity", "mode": "boolean", "text": "(\"test oracle\" OR \"test oracles\" OR \"test adequacy\" OR \"test overfitting\" OR \"reward hacking\" OR \"benchmark contamination\" OR \"data leakage\" OR \"benchmark integrity\") AND (agent OR agents OR agentic OR LLM OR LLMs OR \"language model\" OR \"language models\" OR code OR coding)"},
+    {"id": "D06_formal_assurance", "mode": "boolean", "text": "(\"formal verification\" OR \"program verification\" OR \"verified code\" OR \"verified programs\" OR \"proof generation\" OR Dafny OR Verus OR Coq OR Lean) AND (agent OR agents OR agentic OR LLM OR LLMs OR \"language model\" OR \"language models\")"},
+    {"id": "D07_agent_checks", "mode": "boolean", "text": "(\"code review\" OR \"test generation\" OR \"vulnerability repair\" OR \"software testing\" OR \"code correctness\" OR \"code security\" OR \"code verification\" OR \"code validation\") AND (agent OR agents OR agentic)"}
+  ]
+}
