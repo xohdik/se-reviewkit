@@ -2,7 +2,7 @@
 
 **Auditable literature retrieval and evidence management for software engineering systematic reviews.**
 
-Version 0.4.0 — research prototype. Python 3.10 or newer; no third-party packages. No account credentials, private manuscript, paid publisher exports, or review outcomes are included.
+Version 0.5.0 — research prototype. Python 3.10 or newer; no third-party packages. No account credentials, private manuscript, paid publisher exports, or review outcomes are included.
 
 ## Quick start (Windows PowerShell)
 
@@ -101,6 +101,17 @@ Run the uncapped command only after reviewing the capped pilot. The client uses 
 
 Merge completed arXiv runs just like other providers. Version suffixes on arXiv IDs are normalized for identity linking, while the observed version URLs are retained. A publisher DOI in arXiv metadata is a relationship, not automatic proof of identity with a published paper; record it separately and adjudicate study families. Only exact shared identifiers are merged. Preprints and peer-reviewed publications must be distinguished during screening. No full-text downloads are performed.
 
+### Crossref complementary discovery (v0.5.0; no API key)
+
+Crossref searches are fuzzy ranked bibliographic queries, not equivalent to Boolean title/abstract searches. Use explicit natural-language queries and a predeclared rank cutoff. The example below requests at most 25 candidates for one query; the full example requests at most 200 per query (2,400 occurrences across twelve queries). The provider hit count is **not** the retrieved count or a claim of recall.
+
+```powershell
+py slrkit.py crossref-search --config config/crossref-coding-agents-pilot.json --only C01_agent_verification --out runs/crossref-check-01 --top 25
+py slrkit.py crossref-search --config config/crossref-coding-agents-pilot.json --out runs/crossref-ranked-01 --top 200
+```
+
+The adapter retains the exact date filters, relevance order, raw response, hashes, query text and requested rank limit. `ranked_limit` means the bounded discovery was completed, not exhaustive. The public API requires no key; optionally set `CROSSREF_MAILTO` in the environment for Crossref's polite pool. The client uses a two-second or longer gap between requests and stops on HTTP rate limiting. Missing abstracts and partial publication dates remain visible; no dates are invented. DOI identity linking works with all other sources. Provider-specific differences and study-family decisions still require review. Check the pilot's relevance before choosing and freezing the rank cutoff.
+
 ## Outputs and interpretation
 
 | File | Function |
@@ -125,7 +136,7 @@ Source-exclusive candidate counts and overlaps support a later **coverage audit*
 py -m unittest discover -s tests -v
 ```
 
-Offline tests simulate OpenAlex, Scopus, Semantic Scholar and arXiv responses and synthetic metadata. A real connection must be commissioned on the researcher's network; passing tests do not establish API availability, query adequacy, retrieval recall, AI screening accuracy, or scientific inclusion. The toolkit does not currently implement AI screening, semantic embedding locally, the Web of Science API adapter, screening consensus, automatic BibTeX export, or automatic revision linking. These are planned extensions. Use human validation and disclose any later AI use. Preserve raw licensed files privately and release only permitted metadata.
+Offline tests simulate OpenAlex, Scopus, Semantic Scholar, arXiv and Crossref responses and synthetic metadata. A real connection must be commissioned on the researcher's network; passing tests do not establish API availability, query adequacy, retrieval recall, AI screening accuracy, or scientific inclusion. The toolkit does not currently implement AI screening, semantic embedding locally, the Web of Science API adapter, screening consensus, automatic BibTeX export, or automatic revision linking. These are planned extensions. Use human validation and disclose any later AI use. Preserve raw licensed files privately and release only permitted metadata.
 
 ## Reproducibility and documentation
 
@@ -135,6 +146,7 @@ Offline tests simulate OpenAlex, Scopus, Semantic Scholar and arXiv responses an
 - Semantic Scholar Academic Graph API: https://api.semanticscholar.org/api-docs/
 - arXiv API manual: https://info.arxiv.org/help/api/user-manual.html
 - arXiv API terms: https://info.arxiv.org/help/api/tou.html
+- Crossref REST API: https://www.crossref.org/documentation/retrieve-metadata/rest-api/
 - Search and cursor paging: https://help.openalex.org/api/searching/ and https://help.openalex.org/api/paging/
 - Citation chasing: https://help.openalex.org/how-to/api-recipes/
 - PRISMA-S: https://doi.org/10.1186/s13643-020-01542-z

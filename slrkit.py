@@ -4,6 +4,7 @@ import csv
 import datetime as dt
 import getpass
 import hashlib
+import html
 import json
 import math
 import os
@@ -18,12 +19,13 @@ import xml.etree.ElementTree as ET
 from collections import Counter, defaultdict
 from pathlib import Path
 
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 API = "https://api.openalex.org/works"
 SCOPUS_API = "https://api.elsevier.com/content/search/scopus"
 S2_API = "https://api.semanticscholar.org/graph/v1/paper/search/bulk"
 S2_FIELDS = "paperId,externalIds,title,year,publicationDate,authors,venue,publicationTypes,abstract,url"
 ARXIV_API = "https://export.arxiv.org/api/query"
+CROSSREF_API = "https://api.crossref.org/works"
 ATOM = {"a":"http://www.w3.org/2005/Atom","o":"http://a9.com/-/spec/opensearch/1.1/","x":"http://arxiv.org/schemas/atom"}
 FIELDS = "id,doi,title,publication_year,publication_date,authorships,primary_location,type,abstract_inverted_index,referenced_works,open_access"
 COLS = ["record_id", "title", "year", "publication_date", "doi", "openalex_id", "authors", "venue", "type", "abstract", "url", "sources", "query_ids", "occurrences"]
@@ -180,6 +182,58 @@ class Arxiv:
             raise RuntimeError(f"arXiv HTTP {exc.code}: stop and check API service, access, or query syntax.") from None
         except (urllib.error.URLError,TimeoutError,OSError):
             raise RuntimeError("arXiv connection failed; check network access.") from None
+
+
+def crossref_page(data):
+    message=data.get("message") if isinstance(data,dict) else None
+    if not isinstance(message,dict) or data.get("status")!="ok":
+        raise RuntimeError("Unexpected Crossref response: missing successful message.")
+    total,rows=message.get("total-results"),message.get("items")
+    if not isinstance(total,int) or total<0 or not isinstance(rows,list) or any(not isinstance(r,dict) or not doi(r.get("DOI")) for r in rows):
+        raise RuntimeError("Invalid Crossref results or missing DOI.")
+    return total,rows
+
+
+def normalize_crossref(work):
+    def first(field):
+        values=work.get(field) or []
+        return str(values[0]) if isinstance(values,list) and values else ""
+    parts=(work.get("published") or {}).get("date-parts") or []
+    parts=parts[0] if parts else []
+    year,date="",""
+    if parts and isinstance(parts[0],int) and 1<=parts[0]<=9999:
+        year=f"{parts[0]:04d}"
+        if len(parts)==3:
+            try:
+                date=dt.date(*parts).isoformat()
+            except (ValueError,TypeError):
+                pass
+    clean=lambda value: " ".join(html.unescape(re.sub(r"<[^>]*>"," ",str(value or ""))).split())
+    names=[" ".join(str(a.get(k) or "") for k in ("given","family")).strip() or str(a.get("name") or "") for a in (work.get("author") or []) if isinstance(a,dict)]
+    d=doi(work.get("DOI"))
+    return {"title":clean(first("title")),"year":year,"publication_date":date,"doi":d,"openalex_id":"",
+            "authors":"; ".join(n for n in names if n),"venue":clean(first("container-title")),"type":work.get("type") or "",
+            "abstract":clean(work.get("abstract")),"url":"https://doi.org/"+d}
+
+
+class Crossref:
+    def __init__(self,mailto="",delay=2.0,timeout=60):
+        self.mailto,self.delay,self.timeout=mailto,delay,timeout
+
+    def fetch(self,params):
+        url=CROSSREF_API+"?"+urllib.parse.urlencode({**params,**({"mailto":self.mailto} if self.mailto else {})})
+        try:
+            request=urllib.request.Request(url,headers={"User-Agent":"SE-ReviewKit/"+VERSION,"Accept":"application/json"})
+            with urllib.request.urlopen(request,timeout=self.timeout) as response:
+                body=response.read()
+            time.sleep(self.delay)
+            return json.loads(body),body
+        except urllib.error.HTTPError as exc:
+            raise RuntimeError(f"Crossref HTTP {exc.code}: stop and check API rate limits or availability; do not repeatedly retry.") from None
+        except (urllib.error.URLError,TimeoutError,OSError):
+            raise RuntimeError("Crossref connection failed; check network access.") from None
+        except (ValueError,UnicodeError):
+            raise RuntimeError("Crossref returned a non-JSON response; no data accepted.") from None
 
 
 class SemanticScholar:
@@ -551,6 +605,50 @@ def arxiv_search(args):
         save_manifest(args.out,manifest)
 
 
+def retrieve_crossref(client,out,manifest,qid,params):
+    if not re.fullmatch(r"[A-Za-z0-9_-]+",qid):
+        raise ValueError("Invalid query identifier.")
+    q={"query_id":qid,"params":params,"started_utc":now(),"status":"running","pages":0,"retrieved_occurrences":0,"hits_first_page":None}
+    manifest["queries"].append(q)
+    save_manifest(out,manifest)
+    data,body=client.fetch(params)
+    total,rows=crossref_page(data)
+    ids=[doi(r["DOI"]) for r in rows]
+    if len(rows)!=min(total,params["rows"]) or len(set(ids))!=len(ids):
+        raise RuntimeError("Crossref returned an inconsistent or duplicate-ranked result list; run not complete.")
+    filename=f"raw/{qid}-000001.json"
+    (out/filename).write_bytes(body)
+    manifest["pages"].append({"query_id":qid,"path":filename,"sha256":digest(body),"retrieved_utc":now(),"rows":len(rows)})
+    q.update(hits_first_page=total,retrieved_occurrences=len(rows),pages=1,status="ranked_limit",finished_utc=now())
+    save_manifest(out,manifest)
+    print(f"{qid}: ranked discovery, {len(rows)} records (provider hits {total})",flush=True)
+
+
+def crossref_search(args):
+    config=json.loads(args.config.read_text(encoding="utf-8-sig"))
+    start,end=config["from_date"],config["to_date"]
+    if dt.date.fromisoformat(start)>dt.date.fromisoformat(end) or not 1<=args.top<=1000 or args.delay<2:
+        raise ValueError("Need valid dates, --top 1..1000, and --delay >=2 seconds.")
+    queries=[q for q in config["queries"] if not args.only or q["id"] in args.only]
+    if not queries or len({q["id"] for q in queries})!=len(queries) or (args.only and set(args.only)!={q["id"] for q in queries}):
+        raise ValueError("Need distinct known query IDs.")
+    if any(q.get("mode")!="ranked" or not isinstance(q.get("text"),str) or not q["text"].strip() or re.search(r"\b(?:AND|OR|NOT)\b",q["text"]) for q in queries):
+        raise ValueError("Crossref requires explicit ranked natural-language queries, not Boolean expressions.")
+    config.update(queries=queries,ranked_top_per_query=args.top,retrieval_kind="bounded_ranked_discovery")
+    manifest=run_create(args.out,"crossref_search",config)
+    try:
+        client=Crossref(os.environ.get("CROSSREF_MAILTO","").strip(),delay=args.delay)
+        for q in queries:
+            retrieve_crossref(client,args.out,manifest,q["id"],{"query.bibliographic":q["text"],"filter":f"from-pub-date:{start},until-pub-date:{end}","sort":"score","order":"desc","rows":args.top})
+        manifest["status"]="complete"
+    except (Exception,KeyboardInterrupt):
+        manifest["status"]="failed_or_interrupted"
+        raise
+    finally:
+        manifest["finished_utc"]=now()
+        save_manifest(args.out,manifest)
+
+
 def retrieve(client, out, manifest, query_id, params, max_pages=None):
     if not re.fullmatch(r"[A-Za-z0-9_-]+", query_id):
         raise ValueError("Query identifier must be alphanumeric, underscore or hyphen.")
@@ -684,20 +782,21 @@ def read_run(run, allow_partial):
         data = None if is_arxiv else json.loads(body)
         is_scopus = m.get("kind") == "scopus_search"
         is_s2 = m.get("kind") == "s2_search"
-        results = arxiv_page(body)[2] if is_arxiv else scopus_page(data)[2] if is_scopus else s2_page(data)[1] if is_s2 else data["results"]
+        is_crossref = m.get("kind") == "crossref_search"
+        results = arxiv_page(body)[2] if is_arxiv else scopus_page(data)[2] if is_scopus else s2_page(data)[1] if is_s2 else crossref_page(data)[1] if is_crossref else data["results"]
         if len(results) != p["rows"]:
             raise ValueError(f"Page count mismatch: {path}")
         for i, work in enumerate(results, 1):
-            item = work if is_arxiv else normalize_scopus(work) if is_scopus else normalize_s2(work) if is_s2 else normalize_work(work)
+            item = work if is_arxiv else normalize_scopus(work) if is_scopus else normalize_s2(work) if is_s2 else normalize_crossref(work) if is_crossref else normalize_work(work)
             date = item.get("publication_date") or ""
             scope = "unknown"
             if config.get("from_date") and config.get("to_date") and re.fullmatch(r"\d{4}-\d{2}-\d{2}", date):
                 scope = "in_window" if config["from_date"] <= date <= config["to_date"] else "outside_window"
                 if is_scopus:
                     scope = "cover_date_" + scope
-            if is_s2 and scope == "unknown" and re.fullmatch(r"\d{4}",item["year"]) and config.get("from_date") and config.get("to_date"):
+            if (is_s2 or is_crossref) and scope == "unknown" and re.fullmatch(r"\d{4}",item["year"]) and config.get("from_date") and config.get("to_date"):
                 scope = "year_in_window_date_unknown" if config["from_date"][:4] <= item["year"] <= config["to_date"][:4] else "year_outside_window"
-            yield item, {"source": "arXiv" if is_arxiv else "Scopus" if is_scopus else "Semantic Scholar" if is_s2 else "OpenAlex", "query_id": p["query_id"], "raw_path": str(path), "row": i, "sha256": p["sha256"], "date_scope": scope}
+            yield item, {"source": "arXiv" if is_arxiv else "Scopus" if is_scopus else "Semantic Scholar" if is_s2 else "Crossref" if is_crossref else "OpenAlex", "query_id": p["query_id"], "raw_path": str(path), "row": i, "sha256": p["sha256"], "date_scope": scope}
 
 
 def read_csv(source, path):
@@ -869,6 +968,13 @@ def main(argv=None):
     sp.add_argument("--count", type=int, default=100)
     sp.add_argument("--delay", type=float, default=3.1)
     sp.set_defaults(fn=arxiv_search)
+    sp = sub.add_parser("crossref-search")
+    sp.add_argument("--config", type=Path, required=True)
+    sp.add_argument("--out", type=Path, required=True)
+    sp.add_argument("--only", action="append")
+    sp.add_argument("--top", type=int, default=200, help="Bounded ranked results per query (1..1000).")
+    sp.add_argument("--delay", type=float, default=2.0)
+    sp.set_defaults(fn=crossref_search)
     args = p.parse_args(argv)
     if getattr(args, "max_pages", None) is not None and args.max_pages < 1:
         p.error("--max-pages must be positive")

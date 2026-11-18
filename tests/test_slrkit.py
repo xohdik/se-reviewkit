@@ -359,5 +359,59 @@ class ArxivTests(unittest.TestCase):
                 kit.retrieve_arxiv(client,run,m,"A3",{"max_results":1})
 
 
+def crossref_work(d="10.1234/test",parts=(2025,6,1)):
+    return {"DOI":d,"title":["A <i>verified</i> paper"],"published":{"date-parts":[list(parts)]},"abstract":"<jats:p>Valid &amp; tested.</jats:p>","author":[{"given":"A.","family":"Author"}],"container-title":["Example journal"],"type":"journal-article","score":54.1}
+
+
+def crossref_page(rows,total):
+    return {"status":"ok","message":{"items":rows,"total-results":total}}
+
+
+class CrossrefTests(unittest.TestCase):
+    def test_normalization(self):
+        row=kit.normalize_crossref(crossref_work())
+        self.assertEqual(row["title"],"A verified paper")
+        self.assertEqual(row["abstract"],"Valid & tested.")
+        self.assertEqual(row["publication_date"],"2025-06-01")
+        self.assertEqual(kit.normalize_crossref(crossref_work(parts=(2025,)))["publication_date"],"")
+        self.assertEqual(kit.normalize_crossref(crossref_work(parts=(2025,)))["year"],"2025")
+
+    def test_bounded_search_merge(self):
+        with tempfile.TemporaryDirectory() as d:
+            base=Path(d)
+            run=base/"crossref"
+            m=kit.run_create(run,"crossref_search",{"from_date":"2022-01-01","to_date":"2026-11-18"})
+            client=MockClient([crossref_page([crossref_work()],561390)])
+            kit.retrieve_crossref(client,run,m,"C1",{"rows":1})
+            self.assertEqual(m["queries"][0]["status"],"ranked_limit")
+            self.assertEqual(m["queries"][0]["hits_first_page"],561390)
+            m["status"]="complete"
+            kit.save_manifest(run,m)
+            oa=base/"oa"
+            kit.execute_run(oa,"search",{},[("Q",{})],MockClient([page([work("W1","A verified paper","10.1234/test")])]),None)
+            args=SimpleNamespace(run=[oa,run],csv=[],allow_partial=False,out=base/"merged")
+            kit.merge(args)
+            report=json.loads((args.out/"report.json").read_text())
+            self.assertEqual(report["retrieval_occurrences"],2)
+            self.assertEqual(report["identifier_clusters"],1)
+            self.assertEqual(report["source_overlap"]["OpenAlex"]["Crossref"],1)
+            self.assertEqual(report["date_scope_occurrences"]["in_window"],1)
+            self.assertIsNone(report["inclusion_count"])
+
+    def test_bad_responses_and_rate_limit(self):
+        with self.assertRaisesRegex(RuntimeError,"successful message"):
+            kit.crossref_page({"status":"failed"})
+        with tempfile.TemporaryDirectory() as d:
+            run=Path(d)/"r"
+            m=kit.run_create(run,"crossref_search",{})
+            for rows,total in [([crossref_work(),crossref_work()],2),([],2)]:
+                with self.assertRaisesRegex(RuntimeError,"inconsistent or duplicate"):
+                    kit.retrieve_crossref(MockClient([crossref_page(rows,total)]),run,m,"C1",{"rows":2})
+        with patch("slrkit.urllib.request.urlopen",side_effect=urllib.error.HTTPError("https://api.crossref.org",429,"test",{},None)) as fetch:
+            with self.assertRaisesRegex(RuntimeError,"429"):
+                kit.Crossref().fetch({"rows":1})
+            self.assertEqual(fetch.call_count,1)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1,0 +1,19 @@
+{
+  "status": "example complementary ranked discovery; calibrate and freeze before formal retrieval",
+  "from_date": "2022-01-01",
+  "to_date": "2026-11-18",
+  "queries": [
+    {"id": "C01_agent_verification", "mode": "ranked", "text": "autonomous software engineering coding agent verification"},
+    {"id": "C02_benchmark_integrity", "mode": "ranked", "text": "SWE-bench coding agent benchmark contamination reward hacking"},
+    {"id": "C03_patch_correctness", "mode": "ranked", "text": "large language model agent automated program repair patch correctness"},
+    {"id": "C04_test_oracles", "mode": "ranked", "text": "coding agents test oracle test adequacy generated tests"},
+    {"id": "C05_formal_verification", "mode": "ranked", "text": "large language model code agent formal program verification proof"},
+    {"id": "C06_verifier_models", "mode": "ranked", "text": "software engineering agent patch verifier critic model"},
+    {"id": "C07_security", "mode": "ranked", "text": "autonomous coding agents security vulnerability repair"},
+    {"id": "C08_code_review", "mode": "ranked", "text": "AI coding agent pull request code review validation"},
+    {"id": "C09_regression", "mode": "ranked", "text": "repository level software engineering agent regression tests"},
+    {"id": "C10_evaluation", "mode": "ranked", "text": "agentic software engineering evaluation benchmark reliability"},
+    {"id": "C11_workflows", "mode": "ranked", "text": "autonomous software engineering agents quality assurance human review"},
+    {"id": "C12_related_surveys", "mode": "ranked", "text": "software engineering coding agents systematic literature review evaluation verification"}
+  ]
+}
