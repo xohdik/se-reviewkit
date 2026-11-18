@@ -1,0 +1,11 @@
+{
+  "status": "pilot; provider-specific bulk Boolean query syntax",
+  "from_date": "2022-01-01",
+  "to_date": "2026-11-18",
+  "queries": [
+    {"id": "T01_agent_verification", "text": "(\"coding agent\" | \"software engineering agent\" | \"agentic software engineering\" | \"autonomous coding\" | \"SWE bench\") + (verification | validation | correctness | assurance | oracle | testing | review)"},
+    {"id": "T02_evaluation_integrity", "text": "(\"coding agent\" | \"software engineering agent\" | \"SWE bench\" | \"automated issue resolution\") + (\"test overfitting\" | \"reward hacking\" | leakage | contamination | \"test manipulation\" | \"benchmark validity\")"},
+    {"id": "T03_repository_checks", "text": "(\"repository level\" | \"issue resolution\" | \"patch generation\" | \"program repair\") + (agent | LLM) + (\"patch verification\" | \"test generation\" | \"regression test\" | \"patch correctness\" | \"formal verification\")"},
+    {"id": "T04_verifier_mechanisms", "text": "(\"coding agent\" | \"software engineering agent\" | \"SWE bench\") + (verifier | critic | reviewer | rubric | \"process reward\" | \"test oracle\" | \"formal proof\")"}
+  ]
+}

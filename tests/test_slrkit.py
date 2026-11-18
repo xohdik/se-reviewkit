@@ -127,6 +127,69 @@ class ScopusTests(unittest.TestCase):
         self.assertEqual(conflicts[0]["scopus_ids"],"2-s2.0-1;2-s2.0-2")
 
 
+class SemanticScholarTests(unittest.TestCase):
+    def paper(self,n,d=None):
+        return {"paperId":f"{n:040x}","title":"Example","year":2025,"externalIds":{"DOI":d},
+                "authors":[{"name":"Author"}],"abstract":"Example abstract"}
+
+    def test_bulk_pagination_and_cross_source_overlap(self):
+        with tempfile.TemporaryDirectory() as d:
+            base=Path(d)
+            run=base/"s2"
+            m=kit.run_create(run,"s2_search",{"from_date":"2022-01-01","to_date":"2026-11-18"})
+            a=self.paper(1,"10.1234/a")
+            b=self.paper(2)
+            mock=MockClient([{"total":3,"data":[a],"token":"next"},{"total":3,"data":[b]}])
+            kit.retrieve_s2(mock,run,m,"T1",{},None)
+            self.assertEqual(m["queries"][0]["status"],"exhausted")
+            self.assertEqual(m["queries"][0]["hits_first_page"],3)
+            self.assertEqual(mock.calls[1][0]["token"],"next")
+            m["status"]="complete"
+            kit.save_manifest(run,m)
+            rows=list(kit.read_run(run,False))
+            self.assertEqual(rows[0][1]["date_scope"],"year_in_window_date_unknown")
+            oa=base/"oa"
+            kit.execute_run(oa,"search",{},[("Q",{})],MockClient([page([work("W1","Example","10.1234/a")])]),None)
+            args=SimpleNamespace(run=[oa,run],csv=[],allow_partial=False,out=base/"merged")
+            kit.merge(args)
+            report=json.loads((args.out/"report.json").read_text())
+            self.assertEqual(report["identifier_clusters"],2)
+            self.assertEqual(report["source_overlap"]["OpenAlex"]["Semantic Scholar"],1)
+
+    def test_capped_and_repeated_token(self):
+        with tempfile.TemporaryDirectory() as d:
+            run=Path(d)/"r"
+            m=kit.run_create(run,"s2_search",{})
+            first={"total":3,"data":[self.paper(1)],"token":"next"}
+            kit.retrieve_s2(MockClient([first]),run,m,"T1",{},1)
+            self.assertEqual(m["queries"][0]["status"],"capped")
+            with self.assertRaisesRegex(RuntimeError,"repeated continuation"):
+                kit.retrieve_s2(MockClient([first,{"total":3,"data":[self.paper(2)],"token":"next"}]),run,m,"T2",{},None)
+
+    def test_repeated_paper_id_fails(self):
+        with tempfile.TemporaryDirectory() as d:
+            run=Path(d)/"r"; m=kit.run_create(run,"s2_search",{})
+            with self.assertRaisesRegex(RuntimeError,"repeated a paper ID"):
+                kit.retrieve_s2(MockClient([{"total":2,"data":[self.paper(1)],"token":"next"},
+                     {"total":2,"data":[self.paper(1)]}]),run,m,"T1",{},None)
+
+    def test_anonymous_and_keyed_http(self):
+        from unittest.mock import MagicMock
+        proxy=MagicMock()
+        proxy.__enter__.return_value.read.return_value=kit.json_bytes({"total":0,"data":[]})
+        with patch("slrkit.urllib.request.urlopen",return_value=proxy) as fetch, patch("slrkit.time.sleep"):
+            kit.SemanticScholar().fetch({"query":"example"})
+            self.assertIsNone(fetch.call_args.args[0].get_header("X-api-key"))
+            kit.SemanticScholar("demo-secret").fetch({"query":"example"})
+            self.assertEqual(fetch.call_args.args[0].get_header("X-api-key"),"demo-secret")
+            self.assertNotIn("demo-secret",fetch.call_args.args[0].full_url)
+        error=urllib.error.HTTPError("https://api.semanticscholar.org",429,"test",{},None)
+        with patch("slrkit.urllib.request.urlopen",side_effect=error) as fetch:
+            with self.assertRaisesRegex(RuntimeError,"429"):
+                kit.SemanticScholar().fetch({"query":"example"})
+            self.assertEqual(fetch.call_count,1)
+
+
 class ToolkitTests(unittest.TestCase):
     def test_normalization(self):
         self.assertEqual(kit.doi("https://doi.org/10.1234/ABC"), "10.1234/abc")

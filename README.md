@@ -2,7 +2,7 @@
 
 **Auditable literature retrieval and evidence management for software engineering systematic reviews.**
 
-Version 0.2.0 — research prototype. Python 3.10 or newer; no third-party packages. No account credentials, private manuscript, paid publisher exports, or review outcomes are included.
+Version 0.3.0 — research prototype. Python 3.10 or newer; no third-party packages. No account credentials, private manuscript, paid publisher exports, or review outcomes are included.
 
 ## Quick start (Windows PowerShell)
 
@@ -53,6 +53,18 @@ py slrkit.py merge --run runs/formal-01 --run runs/scopus-full-01 --out outputs/
 
 Do not redistribute licensed raw responses or abstracts without permission. Share only permissible aggregate statistics initially, and validate the data-use policy before transferring raw material to another service.
 
+### Semantic Scholar bulk search (v0.3.0)
+
+The Academic Graph bulk endpoint supports title/abstract Boolean retrieval with continuation tokens and up to 1,000 results per call. Use its provider-specific operators (`+` for AND and `|` for OR), not the syntax of Scopus or OpenAlex. The example below tries a single query and at most one page, with the public unauthenticated API:
+
+```powershell
+py slrkit.py s2-search --config config/s2-coding-agents-pilot.json --only T01_agent_verification --out runs/s2-check-01 --anonymous --max-pages 1
+```
+
+Anonymous access is subject to shared throttling and may be unavailable. If HTTP 429 or authentication errors occur, stop and request a free API key at https://www.semanticscholar.org/product/api. Remove `--anonymous` to enter the key at the hidden prompt (alternatively set `SEMANTIC_SCHOLAR_API_KEY`). After confirming access, use a fresh directory and omit the cap for the chosen calibrated queries. A bulk search's reported total is an estimate; completion is determined by reaching the end of continuation tokens, not equality to that estimate. Null publication dates are preserved and year-only dates separately flagged. Citation counts and publication types are not eligibility filters. Respect the API's terms and applicable metadata licenses.
+
+Merge complete runs using repeated `--run` arguments, as for the other providers. Semantic Scholar paper IDs and DOI links are preserved; title-only matches remain unresolved. No research eligibility decision is automated.
+
 ## Workflow
 
 1. **Calibrate:** revise the example strings with independent reviewers; freeze exact dates and queries, check retrieval of positive controls and reserve some seeds for holdout validation. The supplied configuration is a pilot, not a registered protocol.
@@ -100,13 +112,14 @@ Source-exclusive candidate counts and overlaps support a later **coverage audit*
 py -m unittest discover -s tests -v
 ```
 
-Offline tests simulate OpenAlex and Scopus responses and synthetic metadata. A real authenticated connection must be commissioned on the researcher's network; passing tests do not establish API availability, query adequacy, retrieval recall, AI screening accuracy, or scientific inclusion. The toolkit does not currently implement AI screening, semantic embedding locally, Web of Science or Semantic Scholar API adapters, screening consensus, automatic BibTeX export, or automatic revision linking. These are planned extensions. Use human validation and disclose any later AI use. Preserve raw licensed files privately and release only permitted metadata.
+Offline tests simulate OpenAlex, Scopus and Semantic Scholar responses and synthetic metadata. A real connection must be commissioned on the researcher's network; passing tests do not establish API availability, query adequacy, retrieval recall, AI screening accuracy, or scientific inclusion. The toolkit does not currently implement AI screening, semantic embedding locally, the Web of Science API adapter, screening consensus, automatic BibTeX export, or automatic revision linking. These are planned extensions. Use human validation and disclose any later AI use. Preserve raw licensed files privately and release only permitted metadata.
 
 ## Reproducibility and documentation
 
 - OpenAlex API: https://help.openalex.org/api/
 - Scopus Search API: https://dev.elsevier.com/documentation/ScopusSearchAPI.wadl
 - Scopus access and quotas: https://dev.elsevier.com/api_key_settings.html
+- Semantic Scholar Academic Graph API: https://api.semanticscholar.org/api-docs/
 - Search and cursor paging: https://help.openalex.org/api/searching/ and https://help.openalex.org/api/paging/
 - Citation chasing: https://help.openalex.org/how-to/api-recipes/
 - PRISMA-S: https://doi.org/10.1186/s13643-020-01542-z

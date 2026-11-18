@@ -17,9 +17,11 @@ import urllib.request
 from collections import Counter, defaultdict
 from pathlib import Path
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 API = "https://api.openalex.org/works"
 SCOPUS_API = "https://api.elsevier.com/content/search/scopus"
+S2_API = "https://api.semanticscholar.org/graph/v1/paper/search/bulk"
+S2_FIELDS = "paperId,externalIds,title,year,publicationDate,authors,venue,publicationTypes,abstract,url"
 FIELDS = "id,doi,title,publication_year,publication_date,authorships,primary_location,type,abstract_inverted_index,referenced_works,open_access"
 COLS = ["record_id", "title", "year", "publication_date", "doi", "openalex_id", "authors", "venue", "type", "abstract", "url", "sources", "query_ids", "occurrences"]
 
@@ -101,6 +103,52 @@ def normalize_scopus(work):
         "venue": work.get("prism:publicationName") or "", "type": work.get("subtypeDescription") or work.get("prism:aggregationType") or "",
         "abstract": work.get("dc:description") or "", "url": ("https://doi.org/" + doi(work.get("prism:doi"))) if doi(work.get("prism:doi")) else
         ("https://www.scopus.com/record/display.uri?eid=" + sid if sid else "")}
+
+
+def s2_id(value):
+    value = str(value or "").strip().lower()
+    return value if re.fullmatch(r"[0-9a-f]{40}",value) else ""
+
+
+def normalize_s2(work):
+    return {"title":work.get("title") or "", "year":str(work.get("year") or ""),
+        "publication_date":work.get("publicationDate") or "", "doi":doi((work.get("externalIds") or {}).get("DOI")),
+        "openalex_id":"", "s2_id":s2_id(work.get("paperId")),
+        "authors":"; ".join(a.get("name") or "" for a in (work.get("authors") or [])),
+        "venue":work.get("venue") or "", "type":"; ".join(work.get("publicationTypes") or []),
+        "abstract":work.get("abstract") or "", "url":work.get("url") or ""}
+
+
+class SemanticScholar:
+    def __init__(self, key="", delay=1.1, retries=3, timeout=60):
+        self.key, self.delay, self.retries, self.timeout = key, delay, retries, timeout
+
+    def fetch(self, params):
+        url = S2_API + "?" + urllib.parse.urlencode(params)
+        headers = {"Accept":"application/json","User-Agent":"SE-ReviewKit/"+VERSION}
+        if self.key:
+            headers["x-api-key"] = self.key
+        for n in range(self.retries+1):
+            try:
+                with urllib.request.urlopen(urllib.request.Request(url,headers=headers),timeout=self.timeout) as response:
+                    body=response.read()
+                if self.key and self.key.encode() in body:
+                    raise RuntimeError("Semantic Scholar response contains credential material; page not saved.")
+                time.sleep(self.delay)
+                return json.loads(body),body
+            except urllib.error.HTTPError as exc:
+                if exc.code == 429:
+                    raise RuntimeError("Semantic Scholar HTTP 429: rate limit; wait or request a free API key before a new run.") from None
+                if exc.code in (401,403):
+                    raise RuntimeError(f"Semantic Scholar HTTP {exc.code}: authentication or entitlement required.") from None
+                if exc.code not in (500,502,503,504) or n==self.retries:
+                    raise RuntimeError(f"Semantic Scholar HTTP {exc.code}: check query syntax or service availability.") from None
+                time.sleep(min(60,2**n))
+            except (urllib.error.URLError, TimeoutError, OSError):
+                if n==self.retries:
+                    raise RuntimeError("Semantic Scholar connection failed; check network access.") from None
+                time.sleep(min(60,2**n))
+        raise AssertionError("unreachable")
 
 
 class Scopus:
@@ -292,6 +340,86 @@ def scopus_search(args):
         save_manifest(args.out, manifest)
 
 
+def s2_page(data):
+    rows=data.get("data")
+    total=data.get("total")
+    token=data.get("token")
+    if not isinstance(rows,list) or not isinstance(total,int) or total<0 or (token is not None and not isinstance(token,str)):
+        raise RuntimeError("Unexpected Semantic Scholar bulk response.")
+    if any(not isinstance(r,dict) or not r.get("title") or not s2_id(r.get("paperId")) for r in rows):
+        raise RuntimeError("Invalid Semantic Scholar paper metadata.")
+    if len(rows)>1000:
+        raise RuntimeError("Semantic Scholar bulk page exceeds expected size.")
+    return total,rows,token
+
+
+def retrieve_s2(client,out,manifest,qid,params,max_pages=None):
+    if not re.fullmatch(r"[A-Za-z0-9_-]+",qid):
+        raise ValueError("Invalid query identifier.")
+    entry={"query_id":qid,"params":params,"started_utc":now(),"hits_first_page":None,"retrieved_occurrences":0,"pages":0,"status":"running"}
+    manifest["queries"].append(entry)
+    save_manifest(out,manifest)
+    token=None
+    seen_tokens=set()
+    seen_ids=set()
+    while True:
+        request={**params,**({"token":token} if token else {})}
+        data,body=client.fetch(request)
+        total,rows,next_token=s2_page(data)
+        if entry["pages"]==0:
+            entry["hits_first_page"]=total
+        ids=[s2_id(r["paperId"]) for r in rows]
+        if len(ids)!=len(set(ids)) or seen_ids.intersection(ids):
+            raise RuntimeError("Semantic Scholar repeated a paper ID within one query; run not complete.")
+        seen_ids.update(ids)
+        entry["pages"]+=1
+        entry["retrieved_occurrences"]+=len(rows)
+        filename=f"raw/{qid}-{entry['pages']:06d}.json"
+        (out/filename).write_bytes(body)
+        manifest["pages"].append({"query_id":qid,"path":filename,"sha256":digest(body),"retrieved_utc":now(),"rows":len(rows)})
+        save_manifest(out,manifest)
+        print(f"{qid}: page {entry['pages']}, {entry['retrieved_occurrences']} records (estimated hits {total})",flush=True)
+        if not next_token:
+            entry["status"]="exhausted"
+            break
+        if next_token in seen_tokens or not rows:
+            raise RuntimeError("Semantic Scholar invalid or repeated continuation token; run not complete.")
+        seen_tokens.add(next_token)
+        if max_pages and entry["pages"]>=max_pages:
+            entry["status"]="capped"
+            break
+        if entry["retrieved_occurrences"]>=10000000:
+            raise RuntimeError("Semantic Scholar bulk retrieval limit reached; run not complete.")
+        token=next_token
+    entry["finished_utc"]=now()
+    save_manifest(out,manifest)
+
+
+def s2_search(args):
+    config=json.loads(args.config.read_text(encoding="utf-8"))
+    start,end=config["from_date"],config["to_date"]
+    if dt.date.fromisoformat(start)>dt.date.fromisoformat(end):
+        raise ValueError("Invalid date range.")
+    queries=[q for q in config["queries"] if not args.only or q["id"] in args.only]
+    if not queries or len({q["id"] for q in queries})!=len(queries) or (args.only and set(args.only)!={q["id"] for q in queries}):
+        raise ValueError("Need distinct known query IDs.")
+    config["queries"]=queries
+    config["endpoint"]="paper/search/bulk"
+    secret="" if args.anonymous else (os.environ.get("SEMANTIC_SCHOLAR_API_KEY") or getpass.getpass("Semantic Scholar API key (hidden; Enter for anonymous): ")).strip()
+    client=SemanticScholar(secret,delay=args.delay)
+    manifest=run_create(args.out,"s2_search",config)
+    try:
+        for q in queries:
+            retrieve_s2(client,args.out,manifest,q["id"],{"query":q["text"],"publicationDateOrYear":f"{start}:{end}","fields":S2_FIELDS,"sort":"paperId:asc"},args.max_pages)
+        manifest["status"]="complete" if all(q["status"]=="exhausted" for q in manifest["queries"]) else "partial_capped"
+    except (Exception,KeyboardInterrupt):
+        manifest["status"]="failed_or_interrupted"
+        raise
+    finally:
+        manifest["finished_utc"]=now()
+        save_manifest(args.out,manifest)
+
+
 def retrieve(client, out, manifest, query_id, params, max_pages=None):
     if not re.fullmatch(r"[A-Za-z0-9_-]+", query_id):
         raise ValueError("Query identifier must be alphanumeric, underscore or hyphen.")
@@ -423,18 +551,21 @@ def read_run(run, allow_partial):
             raise ValueError(f"Page checksum mismatch: {path}")
         data = json.loads(body)
         is_scopus = m.get("kind") == "scopus_search"
-        results = scopus_page(data)[2] if is_scopus else data["results"]
+        is_s2 = m.get("kind") == "s2_search"
+        results = scopus_page(data)[2] if is_scopus else s2_page(data)[1] if is_s2 else data["results"]
         if len(results) != p["rows"]:
             raise ValueError(f"Page count mismatch: {path}")
         for i, work in enumerate(results, 1):
-            item = normalize_scopus(work) if is_scopus else normalize_work(work)
+            item = normalize_scopus(work) if is_scopus else normalize_s2(work) if is_s2 else normalize_work(work)
             date = item.get("publication_date") or ""
             scope = "unknown"
             if config.get("from_date") and config.get("to_date") and re.fullmatch(r"\d{4}-\d{2}-\d{2}", date):
                 scope = "in_window" if config["from_date"] <= date <= config["to_date"] else "outside_window"
                 if is_scopus:
                     scope = "cover_date_" + scope
-            yield item, {"source": "Scopus" if is_scopus else "OpenAlex", "query_id": p["query_id"], "raw_path": str(path), "row": i, "sha256": p["sha256"], "date_scope": scope}
+            if is_s2 and scope == "unknown" and re.fullmatch(r"\d{4}",item["year"]) and config.get("from_date") and config.get("to_date"):
+                scope = "year_in_window_date_unknown" if config["from_date"][:4] <= item["year"] <= config["to_date"][:4] else "year_outside_window"
+            yield item, {"source": "Scopus" if is_scopus else "Semantic Scholar" if is_s2 else "OpenAlex", "query_id": p["query_id"], "raw_path": str(path), "row": i, "sha256": p["sha256"], "date_scope": scope}
 
 
 def read_csv(source, path):
@@ -463,7 +594,7 @@ def consolidate(occurrences):
         return i
     seen = {}
     for i, (item, provenance) in enumerate(occurrences):
-        for name in ("doi", "openalex_id", "scopus_id"):
+        for name in ("doi", "openalex_id", "scopus_id", "s2_id"):
             if item.get(name):
                 k = (name, item[name])
                 if k in seen:
@@ -471,7 +602,7 @@ def consolidate(occurrences):
                     parent[max(a, b)] = min(a, b)
                 else:
                     seen[k] = i
-        if not any(item.get(name) for name in ("doi","openalex_id","scopus_id")):
+        if not any(item.get(name) for name in ("doi","openalex_id","scopus_id","s2_id")):
             k = ("exact_occurrence", provenance["source"], provenance["sha256"], provenance["row"])
             if k in seen:
                 a, b = find(i), find(seen[k])
@@ -486,17 +617,20 @@ def consolidate(occurrences):
         ids = sorted({i["doi"] for i, _ in group if i["doi"]})
         wids = sorted({i["openalex_id"] for i, _ in group if i["openalex_id"]})
         sids = sorted({i["scopus_id"] for i, _ in group if i.get("scopus_id")})
-        signature = ids + wids + sids or sorted({p["source"] + ":" + p["sha256"] + ":" + str(p["row"]) for _, p in group})
+        s2ids = sorted({i["s2_id"] for i, _ in group if i.get("s2_id")})
+        signature = ids + wids + sids + s2ids or sorted({p["source"] + ":" + p["sha256"] + ":" + str(p["row"]) for _, p in group})
         rid = "R-" + digest(";".join(signature).encode())[:20]
         row = {k: max((i[k] for i, _ in group), key=lambda v: (len(v), v)) for k in COLS if k in group[0][0]}
         if any("scopus_id" in i for i, _ in group):
             row["scopus_id"] = ";".join(sids)
+        if any("s2_id" in i for i, _ in group):
+            row["s2_id"] = ";".join(s2ids)
         row.update(record_id=rid, sources=";".join(sorted({p["source"] for _, p in group})), query_ids=";".join(sorted({p["query_id"] for _, p in group})), occurrences=len(group))
         records.append(row)
-        if len(ids) > 1 or len(wids) > 1 or len(sids) > 1:
-            conflicts.append({"record_id": rid, "dois": ";".join(ids), "openalex_ids": ";".join(wids), "scopus_ids": ";".join(sids), "status": "needs_adjudication"})
+        if len(ids) > 1 or len(wids) > 1 or len(sids) > 1 or len(s2ids)>1:
+            conflicts.append({"record_id": rid, "dois": ";".join(ids), "openalex_ids": ";".join(wids), "scopus_ids": ";".join(sids), "s2_ids":";".join(s2ids), "status": "needs_adjudication"})
         for item, p in group:
-            provenance.append({"record_id": rid, **p, "observed_doi": item["doi"], "observed_openalex_id": item["openalex_id"], "observed_scopus_id": item.get("scopus_id",""), "observed_title": item["title"]})
+            provenance.append({"record_id": rid, **p, "observed_doi": item["doi"], "observed_openalex_id": item["openalex_id"], "observed_scopus_id": item.get("scopus_id",""), "observed_s2_id":item.get("s2_id",""), "observed_title": item["title"]})
     titles = defaultdict(list)
     for r in records:
         title = normalized_title(r["title"])
@@ -525,10 +659,11 @@ def merge(args):
     records, provenance, conflicts, pairs = consolidate(occurrences)
     args.out.mkdir(parents=True, exist_ok=False)
     has_scopus = any("scopus_id" in i for i, _ in occurrences)
-    cols = COLS + (["scopus_id"] if has_scopus else [])
+    has_s2 = any("s2_id" in i for i, _ in occurrences)
+    cols = COLS + (["scopus_id"] if has_scopus else []) + (["s2_id"] if has_s2 else [])
     csv_write(args.out / "records.csv", records, cols)
-    csv_write(args.out / "provenance.csv", provenance, ["record_id", "source", "query_id", "raw_path", "row", "sha256", "date_scope", "observed_doi", "observed_openalex_id", "observed_title"] + (["observed_scopus_id"] if has_scopus else []))
-    csv_write(args.out / "identifier_conflicts.csv", conflicts, ["record_id", "dois", "openalex_ids", "status"] + (["scopus_ids"] if has_scopus else []))
+    csv_write(args.out / "provenance.csv", provenance, ["record_id", "source", "query_id", "raw_path", "row", "sha256", "date_scope", "observed_doi", "observed_openalex_id", "observed_title"] + (["observed_scopus_id"] if has_scopus else []) + (["observed_s2_id"] if has_s2 else []))
+    csv_write(args.out / "identifier_conflicts.csv", conflicts, ["record_id", "dois", "openalex_ids", "status"] + (["scopus_ids"] if has_scopus else []) + (["s2_ids"] if has_s2 else []))
     csv_write(args.out / "version_candidates.csv", pairs, ["record_a", "record_b", "title", "year_a", "year_b", "status"])
     review_fields = ["reviewer_id", "decision", "exclusion_reason", "notes"]
     for stage in ("title_abstract", "full_text"):
@@ -576,6 +711,14 @@ def main(argv=None):
     sp.add_argument("--count", type=int, default=25)
     sp.add_argument("--delay", type=float, default=1.1)
     sp.set_defaults(fn=scopus_search)
+    sp = sub.add_parser("s2-search")
+    sp.add_argument("--config", type=Path, required=True)
+    sp.add_argument("--out", type=Path, required=True)
+    sp.add_argument("--only", action="append")
+    sp.add_argument("--max-pages", type=int, help="Pilot cap per query (up to 1000 records per page).")
+    sp.add_argument("--anonymous", action="store_true", help="Use public API without a key; shared rate limits apply.")
+    sp.add_argument("--delay", type=float, default=1.1)
+    sp.set_defaults(fn=s2_search)
     args = p.parse_args(argv)
     if getattr(args, "max_pages", None) is not None and args.max_pages < 1:
         p.error("--max-pages must be positive")
