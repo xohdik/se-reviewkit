@@ -88,5 +88,39 @@ class EnrichmentTests(unittest.TestCase):
         ambiguous=record("a","10.1234/a");ambiguous["dblp_doi_candidates"]="10.1234/a;10.1234/b"
         self.assertEqual(kit.enrichment_identity(ambiguous,set())[2],"identity_conflict")
 
+    def test_resume_replays_failed_checkpoint_and_only_queries_remaining(self):
+        with tempfile.TemporaryDirectory() as d:
+            base=Path(d); args=self.setup_inputs(base,[record("a","10.1234/a"),record("b","10.1234/b"),record("c","10.1234/c")]);args.batch_size=1
+            oa=Client([page([work("10.1234/a",ab=False)]),RuntimeError("HTTP 500")]);first=args.out
+            with patch("slrkit.OpenAlex",return_value=oa),patch("slrkit.key",return_value=oa.key):
+                with self.assertRaisesRegex(RuntimeError,"500"):kit.enrich_abstracts(args)
+            # v0.7.0 uses the same raw batch schema; version label is historical.
+            m=json.loads((first/"manifest.json").read_text());m["tool_version"]="0.7.0";kit.write_json(first/"manifest.json",m)
+            before=kit.file_digest(first/"manifest.json")
+            args.resume_from=first;args.out=base/"resume1";args.limit=1;args.crossref=True
+            oa2=Client([page([work("10.1234/b")])]);cr=Client([{"status":"ok","message":{"total-results":1,"items":[{"DOI":"10.1234/a","title":["Test paper"],"published":{"date-parts":[[2025]]},"abstract":"Recovered A."}]}}])
+            with patch("slrkit.OpenAlex",return_value=oa2),patch("slrkit.Crossref",return_value=cr),patch("slrkit.key",return_value=oa.key):kit.enrich_abstracts(args)
+            self.assertEqual(oa2.calls[0]["filter"],"doi:10.1234/b");self.assertEqual(len(oa2.calls),1)
+            self.assertEqual(cr.calls[0]["filter"],"doi:10.1234/a")
+            self.assertEqual(kit.file_digest(first/"manifest.json"),before)
+            report=json.loads((args.out/"report.json").read_text());self.assertEqual(report["recovered"],2);self.assertEqual(report["status_counts"]["not_attempted_limit"],1);self.assertEqual(report["resumed_raw_batches"],1)
+            args.resume_from=args.out;args.out=base/"resume2";args.limit=None
+            oa3=Client([page([work("10.1234/c")])]);cr3=Client([])
+            with patch("slrkit.OpenAlex",return_value=oa3),patch("slrkit.Crossref",return_value=cr3),patch("slrkit.key",return_value=oa.key):kit.enrich_abstracts(args)
+            self.assertEqual(oa3.calls[0]["filter"],"doi:10.1234/c");self.assertFalse(cr3.calls)
+            report=json.loads((args.out/"report.json").read_text());self.assertEqual(report["recovered"],3);self.assertEqual(report["resumed_raw_batches"],3)
+
+    def test_resume_refuses_tampered_raw_or_changed_inputs(self):
+        with tempfile.TemporaryDirectory() as d:
+            base=Path(d);args=self.setup_inputs(base,[record("a","10.1234/a")]);oa=Client([page([work("10.1234/a")])])
+            with patch("slrkit.OpenAlex",return_value=oa),patch("slrkit.key",return_value=oa.key):kit.enrich_abstracts(args)
+            first=args.out;args.resume_from=first;args.out=base/"resume"
+            raw=next((first/"raw").glob("*.json"));original=raw.read_bytes();raw.write_bytes(original+b" ")
+            with self.assertRaisesRegex(ValueError,"raw checksum mismatch"):kit.enrich_abstracts(args)
+            self.assertFalse(args.out.exists());raw.write_bytes(original)
+            source=args.merged/"records.csv";source.write_bytes(source.read_bytes()+b"\n")
+            with self.assertRaisesRegex(ValueError,"does not match"):kit.enrich_abstracts(args)
+            self.assertFalse(args.out.exists())
+
 
 if __name__ == "__main__": unittest.main()
