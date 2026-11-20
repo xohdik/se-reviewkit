@@ -4,6 +4,12 @@
 
 Version **0.8.0** — reproducibility toolkit. Python 3.10 or newer; no third-party runtime packages. No account credentials, private manuscript, paid publisher exports, or review outcomes are included.
 
+## Associated manuscript
+
+**Verification Under Scrutiny: A Systematic Review and Empirical Audit of Autonomous Coding Agents**
+
+This repository provides software for the associated research. The manuscript and private research evidence are not distributed here.
+
 ## Start here
 
 | Task | Tool |
