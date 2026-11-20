@@ -21,7 +21,7 @@ from xml.parsers import expat
 from collections import Counter, defaultdict
 from pathlib import Path
 
-VERSION = "0.7.1"
+VERSION = "0.8.0"
 API = "https://api.openalex.org/works"
 SCOPUS_API = "https://api.elsevier.com/content/search/scopus"
 S2_API = "https://api.semanticscholar.org/graph/v1/paper/search/bulk"
@@ -438,11 +438,12 @@ class SemanticScholar:
     def fetch(self, params):
         url = S2_API + "?" + urllib.parse.urlencode(params)
         headers = {"Accept":"application/json","User-Agent":"SE-ReviewKit/"+VERSION}
-        if self.key:
-            headers["x-api-key"] = self.key
         for n in range(self.retries+1):
             try:
-                with urllib.request.urlopen(urllib.request.Request(url,headers=headers),timeout=self.timeout) as response:
+                request = urllib.request.Request(url, headers=headers)
+                if self.key:
+                    request.add_unredirected_header("X-api-key", self.key)
+                with urllib.request.urlopen(request,timeout=self.timeout) as response:
                     body=response.read()
                 if self.key and self.key.encode() in body:
                     raise RuntimeError("Semantic Scholar response contains credential material; page not saved.")
@@ -470,12 +471,14 @@ class Scopus:
 
     def fetch(self, params):
         url = SCOPUS_API + "?" + urllib.parse.urlencode(params)
-        headers = {"X-ELS-APIKey": self.key, "Accept": "application/json", "User-Agent": "SE-ReviewKit/" + VERSION}
-        if self.insttoken:
-            headers["X-ELS-Insttoken"] = self.insttoken
+        headers = {"Accept": "application/json", "User-Agent": "SE-ReviewKit/" + VERSION}
         for n in range(self.retries + 1):
             try:
-                with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=self.timeout) as response:
+                request = urllib.request.Request(url, headers=headers)
+                request.add_unredirected_header("X-els-apikey", self.key)
+                if self.insttoken:
+                    request.add_unredirected_header("X-els-insttoken", self.insttoken)
+                with urllib.request.urlopen(request, timeout=self.timeout) as response:
                     body = response.read()
                 # Never persist reflected credentials in raw responses.
                 if any(secret and secret.encode() in body for secret in (self.key, self.insttoken)):
@@ -513,10 +516,13 @@ class OpenAlex:
         # Key stays in HTTP Authorization, never in URL, files, or diagnostics.
         url = API + path + ("?" + urllib.parse.urlencode(params) if params else "")
         for n in range(self.retries + 1):
-            req = urllib.request.Request(url, headers={"Authorization": "Bearer " + self.key, "User-Agent": "SE-ReviewKit/" + VERSION, "Accept": "application/json"})
+            req = urllib.request.Request(url, headers={"User-Agent": "SE-ReviewKit/" + VERSION, "Accept": "application/json"})
+            req.add_unredirected_header("Authorization", "Bearer " + self.key)
             try:
                 with urllib.request.urlopen(req, timeout=self.timeout) as response:
                     body = response.read()
+                if self.key and self.key.encode() in body:
+                    raise RuntimeError("OpenAlex response contains credential; refusing to persist it.")
                 time.sleep(self.delay)
                 return json.loads(body), body
             except urllib.error.HTTPError as exc:

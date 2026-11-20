@@ -18,4 +18,4 @@ Before publishing claims of cross-study correctness, two independent readers sho
 
 Retain raw API/publisher metadata according to their licenses and preserve review responses privately. Publish only software, documentation, appropriately licensed aggregate results and sources after author approval. Changes to screening or extraction rules after calibration must be versioned. Do not report a numerical kappa or count as "included" before the corresponding decisions exist.
 
-**Reusable code:** `screening_agreement.py` supports complete-pair agreement. The dedicated calibration/coordinator workflow is still under local validation and should not be claimed as shipped here until its source and tests are published.
+**Reusable code:** `screening_agreement.py` supports complete-pair agreement. `review_calibration.py` freezes source metadata, validates two separate reviewer packets, calculates agreement for complete pairs, and writes unresolved queues. See [the evidence workflow](evidence-workflow.md) for input columns and commands. Reviewer IDs and times are supplied attestations; software cannot establish reviewers' actual independence.

@@ -42,6 +42,22 @@ def scopus_page(results, start, count):
             "opensearch:startIndex":str(start), "entry":results}}
 
 
+class OpenAlexCredentialTests(unittest.TestCase):
+    def test_echoed_key_rejected(self):
+        from unittest.mock import MagicMock
+        proxy=MagicMock()
+        proxy.__enter__.return_value.read.return_value=b'{"echo":"synthetic-test-key"}'
+        with patch('slrkit.urllib.request.urlopen',return_value=proxy) as fetch:
+            with self.assertRaisesRegex(RuntimeError,'credential'):
+                kit.OpenAlex('synthetic-test-key').fetch({'query':'example'})
+            request=fetch.call_args.args[0]
+            self.assertNotIn('synthetic-test-key',request.full_url)
+            self.assertEqual(request.get_header('Authorization'),'Bearer synthetic-test-key')
+            redirected=kit.urllib.request.HTTPRedirectHandler().redirect_request(
+                request,None,302,'Found',{},'https://example.invalid/redirect')
+            self.assertIsNone(redirected.get_header('Authorization'))
+
+
 class ScopusTests(unittest.TestCase):
     def test_key_sent_only_in_header_and_not_persisted(self):
         mock = SimpleNamespace()
@@ -56,6 +72,10 @@ class ScopusTests(unittest.TestCase):
             self.assertNotIn("private-test-key",request.full_url)
             self.assertEqual(request.get_header("X-els-apikey"),"private-test-key")
             self.assertEqual(request.get_header("X-els-insttoken"),"private-token")
+            redirected=kit.urllib.request.HTTPRedirectHandler().redirect_request(
+                request,None,302,'Found',{},'https://example.invalid/redirect')
+            self.assertIsNone(redirected.get_header('X-els-apikey'))
+            self.assertIsNone(redirected.get_header('X-els-insttoken'))
             self.assertNotIn(b"private-test-key",body)
             proxy.__enter__.return_value.read.return_value=b'{"echo":"private-test-key"}'
             with self.assertRaisesRegex(RuntimeError,"credential material"):

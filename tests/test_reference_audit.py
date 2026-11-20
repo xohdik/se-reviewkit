@@ -1,4 +1,7 @@
 import unittest
+import hashlib
+import tempfile
+from pathlib import Path
 from reference_audit import audit
 
 
@@ -21,3 +24,19 @@ class ReferenceAuditTests(unittest.TestCase):
 
     def test_duplicate_component_and_key(self):
         a=record(1);r=audit([a,a]);self.assertTrue(r['duplicate_citekeys']);self.assertTrue(r['duplicate_components'])
+
+    def test_explicit_missing_doi(self):
+        a=record(1,doi=None);self.assertTrue(audit([a])['errors'])
+        a['doi_status']='not_assigned';self.assertFalse(audit([a])['errors'])
+
+    def test_private_archive_checksum_and_path_safety(self):
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d);target=root/'run'/'raw'/'1.json';target.parent.mkdir(parents=True)
+            target.write_bytes(b'{"synthetic":true}')
+            a=record(1);a['page_sha256']=hashlib.sha256(target.read_bytes()).hexdigest()
+            self.assertEqual(audit([a],root)['archive_pages_hashed'],1)
+            self.assertFalse(audit([a],root)['errors'])
+            target.write_bytes(b'changed')
+            self.assertEqual(audit([a],root)['errors'][0]['issue'],'digest_mismatch')
+            a['page']='../../outside.json'
+            self.assertEqual(audit([a],root)['errors'][0]['issue'],'archive_page_unavailable_or_unsafe')

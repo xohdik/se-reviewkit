@@ -2,7 +2,31 @@
 
 **Auditable literature retrieval and evidence management for software engineering systematic reviews.**
 
-Version 0.7.1 — research prototype. Python 3.10 or newer; no third-party packages. No account credentials, private manuscript, paid publisher exports, or review outcomes are included.
+Version **0.8.0** — reproducibility toolkit. Python 3.10 or newer; no third-party runtime packages. No account credentials, private manuscript, paid publisher exports, or review outcomes are included.
+
+## Start here
+
+| Task | Tool |
+| --- | --- |
+| Retrieval, identifier reconciliation and enrichment | `slrkit.py` |
+| Independent screening agreement and calibration | `screening_agreement.py`, `review_calibration.py` |
+| Claim reconstruction and paired comparisons | `claim_audit.py` |
+| Reference identity and archive checksums | `reference_audit.py` |
+| Working study-family and RQ evidence census | `evidence_reconcile.py` |
+| Prospective, gated confirmatory sample selection | `select_families.py` |
+
+Run directly from a checkout, or install the CLI locally in a virtual environment:
+
+```sh
+python -m pip install --no-deps .
+se-reviewkit --version
+se-reviewkit --help
+se-evidence-reconcile --help
+se-select-families --help
+se-review-calibration --help
+```
+
+Keep the checkout for the example query configurations and documentation. See [evidence workflow](docs/evidence-workflow.md), [independent-review requirements](docs/independent-review-gate.md), [security and privacy](SECURITY.md) and [release history](CHANGELOG.md). The tools validate and summarize evidence supplied by researchers; they do not certify search completeness, independent adjudication, scientific validity or confirmatory results.
 
 ## Quick start (Windows PowerShell)
 

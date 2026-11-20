@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "se-reviewkit"
+version = "0.8.0"
+description = "Auditable research retrieval and evidence management for software engineering reviews"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.urls]
+Repository = "https://github.com/xohdik/se-reviewkit"
+
+[project.scripts]
+se-reviewkit = "slrkit:main"
+se-evidence-reconcile = "evidence_reconcile:main"
+se-select-families = "select_families:main"
+se-review-calibration = "review_calibration:main"
+
+[tool.setuptools]
+py-modules = ["slrkit", "claim_audit", "reference_audit", "screening_agreement", "evidence_reconcile", "select_families", "review_calibration"]
